@@ -8,7 +8,7 @@ Rulează pe două servere în același timp:
 | Legacy of CLT (principal) | `1505903653079351357` | angajări, contracte |
 | Legacy EMS (medici) | `1518542545569976492` | arhivă contracte, demisii |
 
-Versiune: `2.0.0-legacy-ems-contracte`
+Versiune: `2.1.0-legacy-ems-contracte`
 
 ---
 
@@ -36,18 +36,20 @@ Toate câmpurile sunt **obligatorii**:
 | `grad_angajator` | gradul celui care face contractul |
 | `grad_angajat` | gradul pe care îl primește membrul angajat |
 
-Botul postează un mesaj care taghează membrul și îi cere să semneze.
+Botul postează în canal un mesaj care taghează membrul, cu datele contractului
+și cu două butoane.
 
-### Pasul 2 — membrul semnează
+### Pasul 2 — membrul apasă un buton
 
-Membrul taggat scrie:
+Mesajul are două butoane, iar membrul taggat **nu trebuie să scrie nimic**:
 
-```text
-/semneaza
-```
+- **✍️ Acceptă / Semnează** → semnează contractul. Semnătura lui este numele IC
+  completat de angajator în `nume_ic`.
+- **❌ Refuză contractul** → contractul nu intră în vigoare, nu se setează nicio
+  dată de intrare, iar angajatorul este anunțat în canal și prin DM.
 
-sau apasă butonul **✍️ Semnează contractul**. Se deschide o fereastră unde își
-scrie semnătura (nume și prenume IC).
+Butoanele funcționează doar pentru membrul din contract; oricine altcineva
+primește un mesaj privat de refuz. După ce se apasă unul, ambele se dezactivează.
 
 ### Pasul 3 — botul face restul, automat
 
@@ -61,7 +63,7 @@ scrie semnătura (nume și prenume IC).
 3. Postează contractul în canalul de contracte din serverul principal.
 4. Postează contractul în canalul `1548329089956581487` din serverul EMS.
 5. Trimite membrului, prin DM, contractul + **invitația în serverul EMS**.
-   Invitația apare și în răspunsul privat al comenzii `/semneaza`.
+   Invitația apare și în răspunsul privat primit după apăsarea butonului.
 
 ---
 
@@ -96,7 +98,7 @@ Rolurile Discord se elimină în continuare **manual** de către conducere.
 
 Nu mai există `/setintrare`. Data intrării este determinată automat, în ordinea:
 
-1. data semnării contractului (`/semneaza`)
+1. data la care membrul a apăsat **Acceptă / Semnează**
 2. o dată salvată anterior în baza de date
 3. data la care membrul a intrat pe serverul Discord EMS
 
@@ -107,10 +109,10 @@ Nu mai există `/setintrare`. Data intrării este determinată automat, în ordi
 | Comandă | Unde | Cine |
 | --- | --- | --- |
 | `/contract` | canalul de contracte, serverul principal | rolurile din `RECRUITER_ROLE_IDS` + administratori |
-| `/semneaza` | serverul principal | membrul care are un contract în așteptare |
 
-Comenzile vechi (`/setintrare`, `/intrare`, `/demisii`) au fost **șterse**
-și sunt eliminate automat de pe Discord la prima pornire.
+`/contract` este **singura** comandă. Tot restul se face din butoane.
+Comenzile vechi (`/setintrare`, `/intrare`, `/demisii`, `/semneaza`) au fost
+**șterse** și sunt eliminate automat de pe Discord la pornire.
 
 ---
 
@@ -184,14 +186,15 @@ local și pe Railway.
 
 ## 7. Storage Railway
 
-Pentru ca contractele și demisiile să nu se piardă la redeploy, montează un
-Railway Volume pe:
+Serviciul `CLT-MEDICI` are deja un Railway Volume (`clt-medici-volume`) montat pe:
 
 ```text
 /data
 ```
 
-Fără volum, botul scrie într-un fișier local `legacy_ems.db` care se pierde la restart.
+Așa rămân salvate contractele, semnăturile și datele de intrare la fiecare
+redeploy. Fără volum, botul scrie într-un fișier local `legacy_ems.db` care se
+pierde la restart.
 
 ---
 

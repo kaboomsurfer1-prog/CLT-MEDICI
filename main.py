@@ -2,7 +2,8 @@
 
 Flux angajare (serverul principal Legacy of CLT):
     1. Un membru cu rol de recrutare folosește `/contract` în canalul de contracte.
-    2. Botul cere membrului taggat să semneze cu `/semneaza` (sau butonul din mesaj).
+    2. Botul taghează membrul și îi dă două butoane: Acceptă / Semnează sau
+       Refuză contractul. Membrul nu trebuie să scrie nimic.
     3. La semnare se generează contractul (imagine PNG) cu ambele semnături,
        se salvează automat data și ora intrării, se postează contractul în
        serverul EMS și se trimite invitația către membru.
@@ -81,7 +82,8 @@ from utils import (
 BASE_DIR = Path(__file__).resolve().parent
 LOGO_DIR = BASE_DIR / "assets" / "logos"
 
-CONTRACT_SIGN_CUSTOM_ID = "legacy_ems_contract_sign"
+CONTRACT_ACCEPT_CUSTOM_ID = "legacy_ems_contract_accept"
+CONTRACT_REFUSE_CUSTOM_ID = "legacy_ems_contract_refuse"
 
 
 # =========================
@@ -365,8 +367,9 @@ def build_contract_pending_embed(row: dict, member: discord.abc.User, recruiter:
         title="📄 Contract de angajare în așteptare",
         description=(
             f"{member.mention}, ai primit un contract de angajare în **{DEPARTMENT_NAME}**.\n\n"
-            "Folosește comanda **`/semneaza`** (sau butonul de mai jos) pentru a semna contractul.\n"
-            "Contractul devine valabil **doar după semnătura ta**."
+            "Apasă **✍️ Acceptă / Semnează** pentru a semna contractul sau "
+            "**❌ Refuză contractul** dacă nu ești de acord. Nu trebuie să scrii nimic.\n"
+            "Contractul devine valabil **doar după ce îl accepți tu**."
         ),
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
@@ -377,7 +380,25 @@ def build_contract_pending_embed(row: dict, member: discord.abc.User, recruiter:
     embed.add_field(name="🎖️ Grad acordat", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
     embed.add_field(name="✍️ Angajator", value=f"{recruiter.mention}\n{row['recruiter_signature']}", inline=True)
     embed.add_field(name="🎖️ Grad angajator", value=row["recruiter_grade"], inline=True)
-    embed.add_field(name="📌 Status", value="🟡 Așteaptă semnătura angajatului", inline=False)
+    embed.add_field(name="📌 Status", value="🟡 Așteaptă răspunsul angajatului", inline=False)
+    embed.set_footer(text=f"ID contract: {row['id']}")
+    return embed
+
+
+def build_contract_refused_embed(row: dict, member: discord.abc.User) -> discord.Embed:
+    embed = discord.Embed(
+        title="❌ Contract refuzat",
+        description=(
+            f"{member.mention} a refuzat contractul de angajare în **{DEPARTMENT_NAME}**.\n"
+            "Contractul nu a intrat în vigoare și nu a fost setată nicio dată de intrare."
+        ),
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
+    embed.add_field(name="🎖️ Grad propus", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(name="✍️ Emis de", value=user_mention(row["recruiter_id"]), inline=True)
+    embed.add_field(name="📌 Status", value="🔴 Refuzat de angajat", inline=False)
     embed.set_footer(text=f"ID contract: {row['id']}")
     return embed
 
@@ -645,84 +666,136 @@ async def build_termination_png(
 
 
 # =========================
-# VIEW + MODAL CONTRACT
+# VIEW CONTRACT (2 BUTOANE)
 # =========================
 
-class ContractSignView(discord.ui.View):
+class ContractDecisionView(discord.ui.View):
+    """Cele două butoane din mesajul contractului: acceptă sau refuză.
+
+    Angajatul nu trebuie să scrie nimic — semnătura lui este numele IC
+    completat de angajator în `/contract`.
+    """
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
     @classmethod
-    def disabled(cls) -> "ContractSignView":
+    def disabled(cls) -> "ContractDecisionView":
         view = cls()
         for item in view.children:
             item.disabled = True
         return view
 
     @discord.ui.button(
-        label="Semnează contractul",
+        label="Acceptă / Semnează",
         style=discord.ButtonStyle.success,
-        custom_id=CONTRACT_SIGN_CUSTOM_ID,
+        custom_id=CONTRACT_ACCEPT_CUSTOM_ID,
         emoji="✍️",
     )
-    async def sign_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await start_signature_flow(interaction)
-
-
-class SemnaturaContractModal(discord.ui.Modal, title="Semnare contract Legacy EMS"):
-    def __init__(self, contract_id: str, default_name: str):
-        super().__init__(timeout=600)
-        self.contract_id = contract_id
-        self.semnatura = discord.ui.TextInput(
-            label="Semnătura ta (Nume și Prenume IC)",
-            placeholder="Exemplu: Andrei Popescu",
-            default=default_name[:60],
-            min_length=3,
-            max_length=60,
-            required=True,
-        )
-        self.add_item(self.semnatura)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            signature = validate_name(str(self.semnatura.value))
-        except ValueError as exc:
-            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        contract = await resolve_own_contract(interaction)
+        if not contract:
             return
-
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await finalize_contract(interaction, self.contract_id, signature)
+        await finalize_contract(interaction, contract["id"], contract["nume_ic"])
+
+    @discord.ui.button(
+        label="Refuză contractul",
+        style=discord.ButtonStyle.danger,
+        custom_id=CONTRACT_REFUSE_CUSTOM_ID,
+        emoji="❌",
+    )
+    async def refuse_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        contract = await resolve_own_contract(interaction)
+        if not contract:
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await refuse_contract(interaction, contract)
 
 
-async def start_signature_flow(interaction: discord.Interaction) -> None:
-    """Comun pentru `/semneaza` și butonul din mesajul contractului."""
+async def resolve_own_contract(interaction: discord.Interaction) -> Optional[dict]:
+    """Contractul din mesajul apăsat, dacă cel care apasă este chiar angajatul."""
     if interaction.guild_id != MAIN_GUILD_ID:
         await interaction.response.send_message(
             "❌ Contractele se semnează doar pe serverul principal Legacy of CLT.",
             ephemeral=True,
         )
-        return
+        return None
 
-    contract = await db.get_pending_contract(interaction.user.id)
-    if not contract:
-        active = await db.get_active_contract(interaction.user.id)
-        if active:
-            await interaction.response.send_message(
-                f"✅ Ai deja un contract semnat (`{active['id']}`) din "
-                f"**{format_dt(active.get('signed_at'))}**.",
-                ephemeral=True,
-            )
-            return
+    contract = None
+    if interaction.message is not None:
+        contract = await db.get_contract_by_message(interaction.message.id)
+    if contract is None:
+        contract = await db.get_pending_contract(interaction.user.id)
+    if contract is None:
         await interaction.response.send_message(
-            "❌ Nu ai niciun contract în așteptare.\n"
-            "Un membru al conducerii trebuie să folosească mai întâi `/contract` pentru tine.",
+            "❌ Nu am găsit contractul acestui mesaj. Cere conducerii să emită unul nou cu `/contract`.",
+            ephemeral=True,
+        )
+        return None
+
+    if int(contract["user_id"]) != interaction.user.id:
+        await interaction.response.send_message(
+            f"❌ Doar {user_mention(contract['user_id'])} poate răspunde la acest contract.",
+            ephemeral=True,
+        )
+        return None
+
+    if contract["status"] != "PENDING_SIGN":
+        await interaction.response.send_message(
+            f"⚠️ Acest contract este deja **{status_ro(contract['status']).lower()}**.",
+            ephemeral=True,
+        )
+        return None
+
+    return contract
+
+
+async def refuse_contract(interaction: discord.Interaction, contract: dict) -> None:
+    updated = await db.refuse_contract(contract["id"], now_iso())
+    if not updated or updated["status"] != "REFUSED":
+        await interaction.followup.send(
+            f"⚠️ Contractul este deja **{status_ro((updated or contract)['status']).lower()}**.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_modal(
-        SemnaturaContractModal(contract["id"], contract["nume_ic"])
+    embed = build_contract_refused_embed(updated, interaction.user)
+    await update_contract_message(updated, embed)
+
+    recruiter_mention = user_mention(updated["recruiter_id"])
+    await send_to_channel(
+        CONTRACT_CHANNEL_ID,
+        content=f"❌ {recruiter_mention} — {interaction.user.mention} a refuzat contractul `{updated['id']}`.",
+        embed=build_contract_refused_embed(updated, interaction.user),
     )
+    await try_dm(
+        int(updated["recruiter_id"]),
+        content=(
+            f"❌ {interaction.user.mention} a refuzat contractul `{updated['id']}` "
+            f"pentru **{updated['nume_ic']}**."
+        ),
+    )
+    await interaction.followup.send(
+        "❌ Ai refuzat contractul. Conducerea a fost anunțată.", ephemeral=True
+    )
+
+
+async def update_contract_message(row: dict, embed: Optional[discord.Embed] = None) -> None:
+    """Dezactivează butoanele din mesajul original al contractului."""
+    if not row.get("message_id") or not row.get("channel_id"):
+        return
+    try:
+        channel = bot.get_channel(int(row["channel_id"])) or await bot.fetch_channel(int(row["channel_id"]))
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return
+        message = await channel.fetch_message(int(row["message_id"]))
+        if embed is not None:
+            await message.edit(embed=embed, view=ContractDecisionView.disabled())
+        else:
+            await message.edit(view=ContractDecisionView.disabled())
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.exception("Nu am putut actualiza mesajul contractului %s.", row["id"])
 
 
 async def finalize_contract(interaction: discord.Interaction, contract_id: str, signature: str) -> None:
@@ -780,14 +853,7 @@ async def finalize_contract(interaction: discord.Interaction, contract_id: str, 
     )
 
     # 3. Dezactivează butonul din mesajul inițial.
-    if row.get("message_id"):
-        try:
-            channel = bot.get_channel(int(row["channel_id"])) or await bot.fetch_channel(int(row["channel_id"]))
-            if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                message = await channel.fetch_message(int(row["message_id"]))
-                await message.edit(view=ContractSignView.disabled())
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
+    await update_contract_message(row)
 
     # 4. Invitație în serverul EMS + document prin DM.
     invite_url = await create_ems_invite(f"Angajare {row['nume_ic']} ({member.id})")
@@ -1177,7 +1243,7 @@ intents.members = True
 
 class LegacyEMSBot(commands.Bot):
     async def setup_hook(self) -> None:
-        self.add_view(ContractSignView())
+        self.add_view(ContractDecisionView())
         self.add_view(DemisieDecisionView())
 
         # Comenzile vechi (/setintrare, /intrare, /demisii) erau înregistrate pe
@@ -1368,6 +1434,10 @@ async def contract_command(
         )
         return
 
+    # Un contract în așteptare mai vechi este anulat de create_contract;
+    # îi dezactivăm și butoanele ca să nu rămână două mesaje active.
+    superseded = await db.get_pending_contract(user.id)
+
     contract_id = new_document_id("CTR")
     row = await db.create_contract(
         contract_id=contract_id,
@@ -1385,24 +1455,18 @@ async def contract_command(
     # Fără defer, ca mențiunea membrului să genereze o notificare reală.
     await interaction.response.send_message(
         content=(
-            f"{user.mention} — ai un contract de angajare în **{DEPARTMENT_NAME}** de semnat.\n"
-            "Scrie **`/semneaza`** sau apasă butonul de mai jos."
+            f"{user.mention} — ai un contract de angajare în **{DEPARTMENT_NAME}**.\n"
+            "Apasă un buton de mai jos: **Acceptă / Semnează** sau **Refuză contractul**."
         ),
         embed=build_contract_pending_embed(row, user, interaction.user),
-        view=ContractSignView(),
+        view=ContractDecisionView(),
         allowed_mentions=discord.AllowedMentions(users=[user]),
     )
     message = await interaction.original_response()
     await db.set_contract_message(contract_id, message.id)
 
-
-@bot.tree.command(
-    name="semneaza",
-    description="Semnează contractul tău de angajare în Legacy EMS.",
-    guild=main_guild_obj,
-)
-async def semneaza_command(interaction: discord.Interaction):
-    await start_signature_flow(interaction)
+    if superseded:
+        await update_contract_message(superseded)
 
 
 @contract_command.error

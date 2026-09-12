@@ -168,10 +168,11 @@ def status_ro(status: str) -> str:
         "PENDING": "În așteptare",
         "ACCEPTED": "Acceptată",
         "REFUSED": "Refuzată",
-        "PENDING_SIGN": "Așteaptă semnătura",
+        "PENDING_SIGN": "Așteaptă răspunsul angajatului",
         "SIGNED": "Semnat / Activ",
         "TERMINATED": "Încetat",
         "CANCELLED": "Anulat",
+        "REFUSED": "Refuzat de angajat",
     }.get(status, status)
 
 

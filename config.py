@@ -43,7 +43,7 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "da", "on"}
 
 
-BOT_VERSION = "2.0.0-legacy-ems-contracte"
+BOT_VERSION = "2.1.0-legacy-ems-contracte"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -54,7 +54,7 @@ MAIN_GUILD_ID = env_int("MAIN_GUILD_ID", 1505903653079351357)
 EMS_GUILD_ID = env_int("EMS_GUILD_ID", 1518542545569976492)
 
 # --- Canale ---
-# Canalul din serverul principal unde se folosesc /contract și /semneaza
+# Canalul din serverul principal unde se folosește /contract
 CONTRACT_CHANNEL_ID = env_int("CONTRACT_CHANNEL_ID", 1548327664694333520)
 # Canalul din serverul EMS unde se postează contractele generate
 CONTRACT_LOG_CHANNEL_ID = env_int("CONTRACT_LOG_CHANNEL_ID", 1548329089956581487)

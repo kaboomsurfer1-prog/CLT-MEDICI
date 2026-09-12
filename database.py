@@ -187,6 +187,34 @@ class Database:
             row = self.conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
             return dict(row) if row else None
 
+    async def get_contract_by_message(self, message_id: int) -> Optional[dict]:
+        async with self.lock:
+            row = self.conn.execute(
+                "SELECT * FROM contracts WHERE message_id = ? ORDER BY created_at DESC LIMIT 1",
+                (str(message_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def refuse_contract(self, contract_id: str, refused_at_iso: str) -> Optional[dict]:
+        """Angajatul a apăsat `Refuză contractul`."""
+        async with self.lock:
+            with self.conn:
+                row = self.conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+                if not row:
+                    return None
+                if row["status"] != "PENDING_SIGN":
+                    return dict(row)
+                self.conn.execute(
+                    """
+                    UPDATE contracts
+                    SET status = 'REFUSED', terminated_at = ?, terminated_reason = 'Contract refuzat de angajat.'
+                    WHERE id = ?
+                    """,
+                    (refused_at_iso, contract_id),
+                )
+                updated = self.conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
+                return dict(updated)
+
     async def get_pending_contract(self, user_id: int) -> Optional[dict]:
         async with self.lock:
             row = self.conn.execute(
