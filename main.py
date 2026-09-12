@@ -1,452 +1,544 @@
+"""Legacy EMS — bot de contracte de angajare și demisii.
+
+Flux angajare (serverul principal Legacy of CLT):
+    1. Un membru cu rol de recrutare folosește `/contract` în canalul de contracte.
+    2. Botul cere membrului taggat să semneze cu `/semneaza` (sau butonul din mesaj).
+    3. La semnare se generează contractul (imagine PNG) cu ambele semnături,
+       se salvează automat data și ora intrării, se postează contractul în
+       serverul EMS și se trimite invitația către membru.
+
+Flux demisie (serverul EMS):
+    1. Membrul scrie modelul `Nume / Ore / Motiv` în canalul de demisii.
+    2. Conducerea acceptă sau refuză din butoane.
+    3. La acceptare se generează Decizia de Încetare a Contractului, cu
+       semnături, data intrării, data încetării și zilele lucrate.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import logging
-import os
+import io
+import random
 import re
-import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, timezone, date, time
+import string
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# =========================
-# CONFIGURARE
-# =========================
-
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return int(raw.strip())
-
-
-def env_ids(name: str, default: str) -> set[int]:
-    raw = os.getenv(name, default)
-    ids: set[int] = set()
-    for part in re.split(r"[,;\s]+", raw.strip()):
-        if part and part.isdigit():
-            ids.add(int(part))
-    return ids
-
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-
-MAIN_GUILD_ID = env_int("MAIN_GUILD_ID", 1505903653079351357)
-EMS_GUILD_ID = env_int("EMS_GUILD_ID", 0)
-
-DEMISIE_CHANNEL_ID = env_int("DEMISIE_CHANNEL_ID", 0)
-EMS_LOG_CHANNEL_ID = env_int("EMS_LOG_CHANNEL_ID", 0)
-MAIN_LOG_CHANNEL_ID = env_int("MAIN_LOG_CHANNEL_ID", 0)
-
-STAFF_ROLE_IDS = env_ids(
-    "STAFF_ROLE_IDS",
-    "",
+import documents
+from config import (
+    BOT_PREFIX,
+    BOT_VERSION,
+    CITY_NAME,
+    CONTRACT_CHANNEL_ID,
+    CONTRACT_LOG_CHANNEL_ID,
+    DB_PATH,
+    DEFAULT_FUNCTION,
+    DELETE_TRIGGER_MESSAGE,
+    DEMISIE_CHANNEL_ID,
+    DEPARTMENT_NAME,
+    DEPARTMENT_SUBTITLE,
+    DISCORD_TOKEN,
+    EMS_GUILD_ID,
+    EMS_INVITE_CHANNEL_ID,
+    EMS_LOGO_URL,
+    EMS_LOG_CHANNEL_ID,
+    INVITE_MAX_AGE,
+    INVITE_MAX_USES,
+    LOCAL_TZ,
+    MAIN_GUILD_ID,
+    MAIN_LOGO_URL,
+    MAIN_LOG_CHANNEL_ID,
+    RECRUITER_ROLE_IDS,
+    STAFF_ROLE_IDS,
+    log,
+    validate_config_startup,
+)
+from database import db
+from utils import (
+    clean_line,
+    duration_seconds_between,
+    format_date_ro,
+    format_days,
+    format_dt,
+    format_duration_seconds,
+    now_iso,
+    now_local,
+    status_ro,
+    top_role_name,
+    unix_from_iso,
+    user_mention,
+    validate_cnp,
+    validate_name,
 )
 
-BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
-DB_PATH = os.getenv("DB_PATH", "/data/legacy_ems.db")
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Bucharest")
-DELETE_TRIGGER_MESSAGE = os.getenv("DELETE_TRIGGER_MESSAGE", "false").lower() in {"1", "true", "yes", "da"}
-BOT_VERSION = "1.0.0-legacy-ems"
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_DIR = BASE_DIR / "assets" / "logos"
 
-try:
-    LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
-except ZoneInfoNotFoundError:
-    LOCAL_TZ = timezone.utc
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("legacy-ems-bot")
+CONTRACT_SIGN_CUSTOM_ID = "legacy_ems_contract_sign"
 
 
 # =========================
-# BAZA DE DATE
+# HELPERE GENERALE
 # =========================
 
-class Database:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.lock = asyncio.Lock()
-        self._migrate()
-
-    def _migrate(self) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS join_dates (
-                    user_id TEXT PRIMARY KEY,
-                    join_date TEXT NOT NULL,
-                    set_by TEXT NOT NULL,
-                    set_at TEXT NOT NULL
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS resignations (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    channel_id TEXT NOT NULL,
-                    message_id TEXT UNIQUE NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    decided_at TEXT,
-                    decided_by TEXT,
-                    reason TEXT,
-                    request_reason TEXT,
-                    request_name TEXT,
-                    request_hours TEXT,
-                    join_date TEXT,
-                    days INTEGER
-                )
-                """
-            )
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_resignations_user_status ON resignations(user_id, status)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_resignations_message ON resignations(message_id)")
-
-            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(resignations)").fetchall()}
-            if "request_reason" not in columns:
-                self.conn.execute("ALTER TABLE resignations ADD COLUMN request_reason TEXT")
-            if "request_name" not in columns:
-                self.conn.execute("ALTER TABLE resignations ADD COLUMN request_name TEXT")
-            if "request_hours" not in columns:
-                self.conn.execute("ALTER TABLE resignations ADD COLUMN request_hours TEXT")
-
-    async def set_join_date(self, user_id: int, join_dt: datetime, set_by: int) -> None:
-        async with self.lock:
-            with self.conn:
-                self.conn.execute(
-                    """
-                    INSERT INTO join_dates(user_id, join_date, set_by, set_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET
-                        join_date=excluded.join_date,
-                        set_by=excluded.set_by,
-                        set_at=excluded.set_at
-                    """,
-                    (str(user_id), join_dt.astimezone(LOCAL_TZ).isoformat(), str(set_by), now_iso()),
-                )
-
-    async def get_join_date(self, user_id: int) -> Optional[str]:
-        async with self.lock:
-            row = self.conn.execute(
-                "SELECT join_date FROM join_dates WHERE user_id = ?",
-                (str(user_id),),
-            ).fetchone()
-            return row["join_date"] if row else None
-
-    async def create_resignation(
-        self,
-        request_id: str,
-        user_id: int,
-        channel_id: int,
-        message_id: int,
-        join_date_iso: Optional[str],
-        days: Optional[int],
-        request_reason: str,
-        request_name: str,
-        request_hours: str,
-    ) -> None:
-        async with self.lock:
-            with self.conn:
-                self.conn.execute(
-                    """
-                    INSERT INTO resignations(
-                        id, user_id, channel_id, message_id, status, created_at, join_date, days, request_reason, request_name, request_hours
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        request_id,
-                        str(user_id),
-                        str(channel_id),
-                        str(message_id),
-                        "PENDING",
-                        now_iso(),
-                        join_date_iso,
-                        days,
-                        request_reason,
-                        request_name,
-                        request_hours,
-                    ),
-                )
-
-    async def get_pending_for_user(self, user_id: int) -> Optional[dict]:
-        async with self.lock:
-            row = self.conn.execute(
-                """
-                SELECT * FROM resignations
-                WHERE user_id = ? AND status = 'PENDING'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (str(user_id),),
-            ).fetchone()
-            return dict(row) if row else None
-
-    async def get_by_message_id(self, message_id: int) -> Optional[dict]:
-        async with self.lock:
-            row = self.conn.execute(
-                "SELECT * FROM resignations WHERE message_id = ? LIMIT 1",
-                (str(message_id),),
-            ).fetchone()
-            return dict(row) if row else None
-
-    async def decide(
-        self,
-        message_id: int,
-        status: str,
-        decided_by: int,
-        reason: Optional[str],
-        join_date_iso: Optional[str],
-        days: Optional[int],
-    ) -> Optional[dict]:
-        async with self.lock:
-            with self.conn:
-                row = self.conn.execute(
-                    "SELECT * FROM resignations WHERE message_id = ? LIMIT 1",
-                    (str(message_id),),
-                ).fetchone()
-                if not row:
-                    return None
-                if row["status"] != "PENDING":
-                    return dict(row)
-
-                self.conn.execute(
-                    """
-                    UPDATE resignations
-                    SET status = ?, decided_at = ?, decided_by = ?, reason = ?, join_date = ?, days = ?
-                    WHERE message_id = ?
-                    """,
-                    (
-                        status,
-                        now_iso(),
-                        str(decided_by),
-                        reason,
-                        join_date_iso,
-                        days,
-                        str(message_id),
-                    ),
-                )
-                updated = self.conn.execute(
-                    "SELECT * FROM resignations WHERE message_id = ? LIMIT 1",
-                    (str(message_id),),
-                ).fetchone()
-                return dict(updated) if updated else None
-
-    async def get_recent_resignations(self, limit: int = 10) -> list[dict]:
-        async with self.lock:
-            rows = self.conn.execute(
-                """
-                SELECT * FROM resignations
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-            return [dict(row) for row in rows]
+def new_document_id(prefix: str) -> str:
+    suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{prefix}-{now_local():%Y%m%d}-{suffix}"
 
 
-db = Database(DB_PATH)
+def has_any_role(member: discord.abc.User, role_ids: set[int]) -> bool:
+    if not isinstance(member, discord.Member):
+        return False
+    return any(role.id in role_ids for role in member.roles)
 
 
-# =========================
-# FUNCTII UTILE
-# =========================
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def unix_from_iso(value: Optional[str]) -> Optional[int]:
-    if not value:
-        return None
-    try:
-        return int(datetime.fromisoformat(value).timestamp())
-    except ValueError:
-        return None
-
-
-def parse_join_date(value: str) -> date:
-    value = value.strip()
-    formats = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y")
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
-            pass
-    raise ValueError("Format dată invalid. Folosește YYYY-MM-DD sau DD/MM/YYYY.")
-
-
-def parse_join_time(value: str) -> time:
-    value = value.strip().replace(".", ":")
-    formats = ("%H:%M", "%H")
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt).time()
-        except ValueError:
-            pass
-    raise ValueError("Format oră invalid. Folosește HH:MM, exemplu 20:30.")
-
-
-def parse_join_datetime(data: str, ora: str) -> datetime:
-    d = parse_join_date(data)
-    t = parse_join_time(ora)
-    join_dt = datetime.combine(d, t, tzinfo=LOCAL_TZ)
-    now_local = datetime.now(LOCAL_TZ)
-    if join_dt > now_local:
-        raise ValueError("Data și ora intrării nu pot fi în viitor.")
-    return join_dt
-
-
-def parse_stored_join_datetime(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        try:
-            d = date.fromisoformat(value)
-            dt = datetime.combine(d, time(0, 0), tzinfo=LOCAL_TZ)
-        except ValueError:
-            return None
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=LOCAL_TZ)
-    return dt.astimezone(LOCAL_TZ)
-
-
-def calculate_duration_seconds(join_date_iso: Optional[str]) -> Optional[int]:
-    join_dt = parse_stored_join_datetime(join_date_iso)
-    if not join_dt:
-        return None
-    seconds = int((datetime.now(LOCAL_TZ) - join_dt).total_seconds())
-    return max(0, seconds)
-
-
-def calculate_days(join_date_iso: Optional[str]) -> Optional[int]:
-    seconds = calculate_duration_seconds(join_date_iso)
-    if seconds is None:
-        return None
-    return seconds // 86400
-
-
-def format_days(days: Optional[int]) -> str:
-    if days is None:
-        return "Necunoscut"
-    if days == 1:
-        return "1 zi"
-    return f"{days} zile"
-
-
-def format_duration_from_join(join_date_iso: Optional[str]) -> str:
-    seconds = calculate_duration_seconds(join_date_iso)
-    if seconds is None:
-        return "Necunoscut"
-
-    total_minutes = seconds // 60
-    days = total_minutes // (24 * 60)
-    hours = (total_minutes % (24 * 60)) // 60
-    minutes = total_minutes % 60
-
-    parts: list[str] = []
-    if days == 1:
-        parts.append("1 zi")
-    elif days > 1:
-        parts.append(f"{days} zile")
-
-    if hours == 1:
-        parts.append("1 oră")
-    elif hours > 1:
-        parts.append(f"{hours} ore")
-
-    if minutes == 1:
-        parts.append("1 minut")
-    elif minutes > 1:
-        parts.append(f"{minutes} minute")
-
-    if not parts:
-        return "Sub 1 minut"
-    return ", ".join(parts)
-
-
-def format_join_date(join_date_iso: Optional[str]) -> str:
-    join_dt = parse_stored_join_datetime(join_date_iso)
-    if not join_dt:
-        return "Nesetată" if not join_date_iso else "Invalidă"
-    return join_dt.strftime("%d/%m/%Y %H:%M")
-
-
-def is_valid_join_date(join_date_iso: Optional[str]) -> bool:
-    return parse_stored_join_datetime(join_date_iso) is not None
+def is_recruiter(member: discord.abc.User) -> bool:
+    if has_any_role(member, RECRUITER_ROLE_IDS):
+        return True
+    return isinstance(member, discord.Member) and member.guild_permissions.administrator
 
 
 def is_staff(member: discord.abc.User) -> bool:
+    if has_any_role(member, STAFF_ROLE_IDS):
+        return True
     if not isinstance(member, discord.Member):
         return False
-    return any(role.id in STAFF_ROLE_IDS for role in member.roles)
+    # Fără STAFF_ROLE_IDS configurat, cade pe permisiunea de gestionare server.
+    if not STAFF_ROLE_IDS and member.guild_permissions.manage_guild:
+        return True
+    return member.guild_permissions.administrator
 
 
-def user_mention(user_id: str | int) -> str:
-    return f"<@{user_id}>"
+def channel_matches(channel: Optional[discord.abc.GuildChannel], channel_id: int) -> bool:
+    if channel is None or not channel_id:
+        return False
+    if channel.id == channel_id:
+        return True
+    return getattr(channel, "parent_id", None) == channel_id
 
 
-def status_ro(status: str) -> str:
-    return {
-        "PENDING": "În așteptare",
-        "ACCEPTED": "Acceptată",
-        "REFUSED": "Refuzată",
-    }.get(status, status)
+def make_file(payload: bytes, filename: str) -> discord.File:
+    return discord.File(io.BytesIO(payload), filename=filename)
 
 
-async def send_to_channel(bot: commands.Bot, channel_id: int, *, content: Optional[str] = None, embed: Optional[discord.Embed] = None) -> None:
+def display_tag(user: discord.abc.User) -> str:
+    name = getattr(user, "name", str(user))
+    return f"@{name}"
+
+
+async def send_to_channel(
+    channel_id: int,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    file_payload: Optional[bytes] = None,
+    filename: str = "document.png",
+) -> Optional[discord.Message]:
+    if not channel_id:
+        return None
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        if isinstance(channel, (discord.TextChannel, discord.Thread)):
-            await channel.send(content=content, embed=embed)
-        else:
-            log.warning("Canalul %s nu este TextChannel/Thread.", channel_id)
-    except discord.Forbidden:
-        log.exception("Botul nu are permisiune să trimită mesaje în canalul %s.", channel_id)
-    except discord.NotFound:
-        log.exception("Canalul %s nu a fost găsit.", channel_id)
-    except discord.HTTPException:
-        log.exception("Eroare Discord la trimiterea mesajului în canalul %s.", channel_id)
-
-
-def parse_demisie_template(content: str) -> Optional[tuple[str, str, str]]:
-    """Parsează modelul:
-    Nume:
-    Ore:
-    Motiv:
-
-    Acceptă și varianta cu `demisia` / `demisie` pe primul rând.
-    """
-    text = content.strip()
-    text = re.sub(r"^\s*(demisia|demisie)\s*[:\-]?\s*", "", text, flags=re.IGNORECASE)
-
-    match = re.search(
-        r"(?is)^\s*nume\s*:\s*(?P<nume>.+?)\s+ore\s*:\s*(?P<ore>.+?)\s+motiv\s*:\s*(?P<motiv>.+?)\s*$",
-        text,
-    )
-    if not match:
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.exception("Nu am putut accesa canalul %s.", channel_id)
         return None
 
-    nume = re.sub(r"\s+", " ", match.group("nume")).strip()
-    ore = re.sub(r"\s+", " ", match.group("ore")).strip()
-    motiv = match.group("motiv").strip()
-    return nume, ore, motiv
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        log.warning("Canalul %s nu este TextChannel/Thread.", channel_id)
+        return None
+
+    kwargs: dict = {}
+    if content:
+        kwargs["content"] = content
+    if embed is not None:
+        kwargs["embed"] = embed
+    if file_payload is not None:
+        kwargs["file"] = make_file(file_payload, filename)
+    try:
+        return await channel.send(**kwargs)
+    except discord.HTTPException:
+        log.exception("Nu am putut trimite mesajul în canalul %s.", channel_id)
+        return None
+
+
+async def try_dm(
+    user_id: int,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    file_payload: Optional[bytes] = None,
+    filename: str = "document.png",
+) -> bool:
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        kwargs: dict = {}
+        if content:
+            kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
+        if file_payload is not None:
+            kwargs["file"] = make_file(file_payload, filename)
+        await user.send(**kwargs)
+        return True
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+        return False
+
+
+# =========================
+# LOGO-URI
+# =========================
+
+class LogoStore:
+    """Logo-urile folosite pe documente.
+
+    Ordine: fișier local în ``assets/logos`` -> variabilă de mediu cu URL -> iconița serverului.
+    """
+
+    LOCAL_NAMES = {
+        "main": ("main.png", "main.jpg", "main.jpeg", "main.webp", "logo_main.png", "clt.png"),
+        "ems": ("ems.png", "ems.jpg", "ems.jpeg", "ems.webp", "logo_ems.png"),
+    }
+
+    def __init__(self) -> None:
+        self._cache: dict[str, Optional[bytes]] = {}
+        self._warned: set[str] = set()
+
+    async def get(self, key: str) -> Optional[bytes]:
+        if self._cache.get(key):
+            return self._cache[key]
+
+        payload = self._from_disk(key) or await self._from_url(key) or await self._from_guild_icon(key)
+        self._cache[key] = payload
+        if payload is None and key not in self._warned:
+            self._warned.add(key)
+            log.warning(
+                "Nu am găsit logo pentru '%s'. Documentele folosesc un substitut. "
+                "Adaugă assets/logos/%s.png sau setează %s_LOGO_URL.",
+                key,
+                key,
+                key.upper(),
+            )
+        return payload
+
+    def _from_disk(self, key: str) -> Optional[bytes]:
+        for name in self.LOCAL_NAMES.get(key, ()):
+            path = LOGO_DIR / name
+            if path.exists() and path.is_file():
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    log.exception("Nu am putut citi logo-ul %s.", path)
+        return None
+
+    async def _from_url(self, key: str) -> Optional[bytes]:
+        url = MAIN_LOGO_URL if key == "main" else EMS_LOGO_URL
+        if not url:
+            return None
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        return await response.read()
+                    log.warning("Logo %s: răspuns HTTP %s de la %s.", key, response.status, url)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            log.exception("Nu am putut descărca logo-ul de la %s.", url)
+        return None
+
+    async def _from_guild_icon(self, key: str) -> Optional[bytes]:
+        guild_id = MAIN_GUILD_ID if key == "main" else EMS_GUILD_ID
+        guild = bot.get_guild(guild_id)
+        if guild is None or guild.icon is None:
+            return None
+
+        asset = guild.icon
+        try:
+            asset = asset.with_size(512)
+        except ValueError:
+            pass
+        if not asset.is_animated():
+            try:
+                asset = asset.with_format("png")
+            except ValueError:
+                pass
+        try:
+            return await asset.read()
+        except (discord.HTTPException, discord.NotFound, discord.DiscordException):
+            log.exception("Nu am putut citi iconița serverului %s.", guild_id)
+            return None
+
+
+logos = LogoStore()
+
+
+async def document_logos() -> tuple[Optional[bytes], Optional[bytes]]:
+    return await logos.get("main"), await logos.get("ems")
+
+
+# =========================
+# INVITAȚIE SERVER EMS
+# =========================
+
+async def create_ems_invite(reason: str) -> Optional[str]:
+    guild = bot.get_guild(EMS_GUILD_ID)
+    if guild is None:
+        log.warning("Botul nu este în serverul EMS %s, nu pot genera invitația.", EMS_GUILD_ID)
+        return None
+
+    candidates: list[discord.abc.GuildChannel] = []
+    if EMS_INVITE_CHANNEL_ID:
+        channel = guild.get_channel(EMS_INVITE_CHANNEL_ID)
+        if channel is not None:
+            candidates.append(channel)
+    for channel in (guild.rules_channel, guild.system_channel):
+        if channel is not None:
+            candidates.append(channel)
+    candidates.extend(sorted(guild.text_channels, key=lambda c: c.position))
+
+    seen: set[int] = set()
+    for channel in candidates:
+        if channel.id in seen:
+            continue
+        seen.add(channel.id)
+        permissions = channel.permissions_for(guild.me)
+        if not permissions.create_instant_invite:
+            continue
+        try:
+            invite = await channel.create_invite(
+                max_age=INVITE_MAX_AGE,
+                max_uses=INVITE_MAX_USES,
+                unique=True,
+                reason=reason[:400],
+            )
+            return invite.url
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    log.warning("Nu am putut genera nicio invitație în serverul EMS %s.", EMS_GUILD_ID)
+    return None
+
+
+# =========================
+# DATA INTRĂRII
+# =========================
+
+async def resolve_join_date(user_id: int, ems_member: Optional[discord.Member] = None) -> Optional[str]:
+    """Data intrării: contract semnat -> valoare salvată -> intrarea pe Discord."""
+    contract = await db.get_active_contract(user_id)
+    if contract and contract.get("signed_at"):
+        return contract["signed_at"]
+
+    stored = await db.get_join_date(user_id)
+    if stored:
+        return stored
+
+    if ems_member is not None and ems_member.joined_at is not None:
+        return ems_member.joined_at.astimezone(LOCAL_TZ).isoformat()
+    return None
+
+
+async def fetch_ems_member(user_id: int) -> Optional[discord.Member]:
+    guild = bot.get_guild(EMS_GUILD_ID)
+    if guild is None:
+        return None
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except (discord.NotFound, discord.HTTPException):
+        return None
+
+
+# =========================
+# EMBED-URI CONTRACT
+# =========================
+
+def build_contract_pending_embed(row: dict, member: discord.abc.User, recruiter: discord.abc.User) -> discord.Embed:
+    embed = discord.Embed(
+        title="📄 Contract de angajare în așteptare",
+        description=(
+            f"{member.mention}, ai primit un contract de angajare în **{DEPARTMENT_NAME}**.\n\n"
+            "Folosește comanda **`/semneaza`** (sau butonul de mai jos) pentru a semna contractul.\n"
+            "Contractul devine valabil **doar după semnătura ta**."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="👤 Membru", value=f"{member.mention}\n`{member.id}`", inline=True)
+    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
+    embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
+    embed.add_field(name="💼 Funcția", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(name="✍️ Angajator", value=f"{recruiter.mention}\n{row['recruiter_signature']}", inline=True)
+    embed.add_field(name="🎖️ Grad angajator", value=row["recruiter_grade"], inline=True)
+    embed.add_field(name="📌 Status", value="🟡 Așteaptă semnătura angajatului", inline=False)
+    embed.set_footer(text=f"ID contract: {row['id']}")
+    return embed
+
+
+def build_contract_signed_embed(row: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="✅ Contract semnat",
+        description=(
+            f"{user_mention(row['user_id'])} a semnat contractul de angajare în **{DEPARTMENT_NAME}** "
+            f"({DEPARTMENT_SUBTITLE})."
+        ),
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
+    embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
+    embed.add_field(name="💼 Funcția", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(name="✍️ Semnătura angajatului", value=row.get("member_signature") or "—", inline=True)
+    embed.add_field(name="🎖️ Angajat de", value=f"{row['recruiter_signature']}\n{row['recruiter_grade']}", inline=True)
+    signed_ts = unix_from_iso(row.get("signed_at"))
+    embed.add_field(
+        name="📅 Data intrării",
+        value=f"<t:{signed_ts}:F>" if signed_ts else format_dt(row.get("signed_at")),
+        inline=True,
+    )
+    embed.set_image(url="attachment://contract.png")
+    embed.set_footer(text=f"ID contract: {row['id']} • {DEPARTMENT_NAME}")
+    return embed
+
+
+def build_termination_embed(contract: Optional[dict], resignation: dict, durata: str, zile: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="📕 Decizie de încetare a contractului",
+        description=(
+            f"{user_mention(resignation['user_id'])} nu mai face parte din **{DEPARTMENT_NAME}** "
+            f"({DEPARTMENT_SUBTITLE})."
+        ),
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if contract:
+        embed.add_field(name="🪪 Nume IC", value=contract["nume_ic"], inline=True)
+        embed.add_field(name="🔢 CNP", value=contract["cnp"], inline=True)
+        embed.add_field(name="💼 Funcția", value=contract.get("functie") or DEFAULT_FUNCTION, inline=True)
+    elif resignation.get("request_name"):
+        embed.add_field(name="🪪 Nume", value=resignation["request_name"][:256], inline=True)
+
+    embed.add_field(name="📅 Data intrării", value=format_dt(resignation.get("join_date")), inline=True)
+    embed.add_field(
+        name="📅 Data încetării",
+        value=format_dt(resignation.get("decided_at") or now_iso()),
+        inline=True,
+    )
+    embed.add_field(name="⏳ Perioadă lucrată", value=durata, inline=True)
+    embed.add_field(name="🗓️ Total zile", value=zile, inline=True)
+    if resignation.get("decided_by"):
+        embed.add_field(name="👮 Aprobată de", value=user_mention(resignation["decided_by"]), inline=True)
+    if resignation.get("request_reason"):
+        embed.add_field(name="📝 Motiv", value=resignation["request_reason"][:1024], inline=False)
+    embed.set_image(url="attachment://demisie.png")
+    embed.set_footer(text=f"ID cerere: {resignation['id']} • {DEPARTMENT_NAME}")
+    return embed
+
+
+# =========================
+# EMBED-URI DEMISIE
+# =========================
+
+def build_pending_embed(
+    member: discord.Member,
+    request_id: str,
+    join_date_iso: Optional[str],
+    request_reason: str,
+    request_name: str,
+    request_hours: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="📋 Cerere de Demisie",
+        description=(
+            f"{member.mention} a depus o cerere de demisie din **{DEPARTMENT_NAME}**.\n\n"
+            "Conducerea trebuie să aleagă o acțiune folosind butoanele de mai jos."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="👤 Membru", value=f"{member.mention}\n`{member.id}`", inline=True)
+    embed.add_field(name="🪪 Nume", value=request_name[:256], inline=True)
+    embed.add_field(name="⏱️ Ore", value=request_hours[:256], inline=True)
+    embed.add_field(name="📅 Data intrării", value=format_dt(join_date_iso), inline=True)
+    embed.add_field(
+        name="⏳ Timp în departament",
+        value=format_duration_seconds(duration_seconds_between(join_date_iso)),
+        inline=True,
+    )
+    embed.add_field(name="📝 Motiv", value=request_reason[:1024], inline=False)
+    embed.add_field(name="📌 Status", value="🟡 În așteptare", inline=False)
+    embed.set_footer(text=f"ID cerere: {request_id}")
+    return embed
+
+
+def build_decision_embed(row: dict) -> discord.Embed:
+    status = row["status"]
+    if status == "ACCEPTED":
+        title, color, status_line = "✅ Demisie Acceptată", discord.Color.green(), "🟢 Acceptată"
+    elif status == "REFUSED":
+        title, color, status_line = "❌ Demisie Refuzată", discord.Color.red(), "🔴 Refuzată"
+    else:
+        title, color, status_line = "📋 Cerere de Demisie", discord.Color.orange(), "🟡 În așteptare"
+
+    embed = discord.Embed(
+        title=title,
+        description=f"Cererea de demisie pentru {user_mention(row['user_id'])} a fost actualizată.",
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="👤 Membru", value=f"{user_mention(row['user_id'])}\n`{row['user_id']}`", inline=True)
+    if row.get("request_name"):
+        embed.add_field(name="🪪 Nume", value=row["request_name"][:256], inline=True)
+    if row.get("request_hours"):
+        embed.add_field(name="⏱️ Ore", value=row["request_hours"][:256], inline=True)
+    embed.add_field(name="📅 Data intrării", value=format_dt(row.get("join_date")), inline=True)
+    embed.add_field(
+        name="⏳ Timp în departament",
+        value=format_duration_seconds(
+            duration_seconds_between(row.get("join_date"), row.get("decided_at") or None)
+        ),
+        inline=True,
+    )
+    embed.add_field(name="📌 Status", value=status_line, inline=False)
+    if row.get("request_reason"):
+        embed.add_field(name="📝 Motiv", value=row["request_reason"][:1024], inline=False)
+    if row.get("decided_by"):
+        embed.add_field(name="👮 Decizie luată de", value=user_mention(row["decided_by"]), inline=True)
+    decided_ts = unix_from_iso(row.get("decided_at"))
+    if decided_ts:
+        embed.add_field(name="🕒 Data deciziei", value=f"<t:{decided_ts}:F>", inline=True)
+    if status == "REFUSED" and row.get("reason"):
+        embed.add_field(name="📝 Motivul refuzului", value=row["reason"][:1024], inline=False)
+
+    embed.add_field(name="⚠️ Roluri", value="Rolurile se elimină manual de către conducere.", inline=False)
+    embed.set_footer(text=f"ID cerere: {row['id']}")
+    return embed
+
+
+def build_refused_public_embed(row: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="❌ Demisie Refuzată",
+        description=f"{user_mention(row['user_id'])}, demisia ta a fost refuzată de către conducere.",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    if row.get("decided_by"):
+        embed.add_field(name="👮 Refuzată de", value=user_mention(row["decided_by"]), inline=True)
+    if row.get("request_name"):
+        embed.add_field(name="🪪 Nume", value=row["request_name"][:256], inline=True)
+    if row.get("request_hours"):
+        embed.add_field(name="⏱️ Ore", value=row["request_hours"][:256], inline=True)
+    if row.get("request_reason"):
+        embed.add_field(name="📝 Motiv", value=row["request_reason"][:1024], inline=False)
+    embed.add_field(name="📝 Motivul refuzului", value=(row.get("reason") or "Nespecificat")[:1024], inline=False)
+    embed.set_footer(text=f"{DEPARTMENT_NAME} • {DEPARTMENT_SUBTITLE}")
+    return embed
 
 
 def demisie_format_message() -> str:
@@ -466,129 +558,278 @@ def demisie_format_message() -> str:
     )
 
 
-# =========================
-# EMBED-URI
-# =========================
-
-def build_pending_embed(member: discord.Member, request_id: str, join_date_iso: Optional[str], days: Optional[int], request_reason: str, request_name: str, request_hours: str) -> discord.Embed:
-    embed = discord.Embed(
-        title="📋 Cerere de Demisie",
-        description=(
-            f"{member.mention} a depus o cerere de demisie din **Legacy EMS**.\n\n"
-            "Conducerea trebuie să aleagă o acțiune folosind butoanele de mai jos."
-        ),
-        color=discord.Color.orange(),
-        timestamp=datetime.now(timezone.utc),
+def parse_demisie_template(content: str) -> Optional[tuple[str, str, str]]:
+    text = re.sub(r"^\s*(demisia|demisie)\s*[:\-]?\s*", "", content.strip(), flags=re.IGNORECASE)
+    match = re.search(
+        r"(?is)^\s*nume\s*:\s*(?P<nume>.+?)\s+ore\s*:\s*(?P<ore>.+?)\s+motiv\s*:\s*(?P<motiv>.+?)\s*$",
+        text,
     )
-    embed.add_field(name="👤 Membru", value=f"{member.mention}\n`{member.id}`", inline=True)
-    embed.add_field(name="🪪 Nume", value=request_name[:256], inline=True)
-    embed.add_field(name="⏱️ Ore", value=request_hours[:256], inline=True)
-    embed.add_field(name="📅 Data intrării", value=format_join_date(join_date_iso), inline=True)
-    embed.add_field(name="⏳ Timp în departament", value=format_duration_from_join(join_date_iso), inline=True)
-    embed.add_field(name="📝 Motiv", value=request_reason[:1024], inline=False)
-    embed.add_field(name="📌 Status", value="🟡 În așteptare", inline=False)
-    embed.set_footer(text=f"ID cerere: {request_id}")
-    return embed
+    if not match:
+        return None
+    return (
+        re.sub(r"\s+", " ", match.group("nume")).strip(),
+        re.sub(r"\s+", " ", match.group("ore")).strip(),
+        match.group("motiv").strip(),
+    )
 
 
-def build_decision_embed(row: dict) -> discord.Embed:
-    status = row["status"]
-    if status == "ACCEPTED":
-        title = "✅ Demisie Acceptată"
-        color = discord.Color.green()
-        status_line = "🟢 Acceptată"
-    elif status == "REFUSED":
-        title = "❌ Demisie Refuzată"
-        color = discord.Color.red()
-        status_line = "🔴 Refuzată"
+# =========================
+# GENERARE DOCUMENTE
+# =========================
+
+async def build_contract_png(row: dict, member: discord.abc.User, recruiter: discord.abc.User) -> bytes:
+    logo_main, logo_ems = await document_logos()
+    return await asyncio.to_thread(
+        documents.render_contract,
+        contract_id=row["id"],
+        nume_ic=row["nume_ic"],
+        cnp=row["cnp"],
+        functie=row.get("functie") or DEFAULT_FUNCTION,
+        discord_tag=display_tag(member),
+        discord_id=str(row["user_id"]),
+        data_angajarii=format_date_ro(row.get("signed_at")),
+        semnatura_angajat=row.get("member_signature") or row["nume_ic"],
+        semnatura_angajator=row["recruiter_signature"],
+        grad_angajator=row["recruiter_grade"],
+        angajator_discord=display_tag(recruiter),
+        emis_la=format_dt(row.get("signed_at") or row.get("created_at")),
+        city=CITY_NAME,
+        department=DEPARTMENT_NAME,
+        department_subtitle=DEPARTMENT_SUBTITLE,
+        logo_main=logo_main,
+        logo_ems=logo_ems,
+    )
+
+
+async def build_termination_png(
+    *,
+    document_id: str,
+    contract: Optional[dict],
+    resignation: dict,
+    member: Optional[discord.abc.User],
+    staff: discord.abc.User,
+    staff_signature: str,
+    staff_grade: str,
+    join_date_iso: Optional[str],
+    end_iso: str,
+    worked_seconds: Optional[int],
+) -> bytes:
+    logo_main, logo_ems = await document_logos()
+    nume_ic = (contract or {}).get("nume_ic") or resignation.get("request_name") or "Necunoscut"
+    member_signature = (contract or {}).get("member_signature") or nume_ic
+    return await asyncio.to_thread(
+        documents.render_termination,
+        document_id=document_id,
+        contract_id=(contract or {}).get("id") or "fără contract înregistrat",
+        nume_ic=nume_ic,
+        cnp=(contract or {}).get("cnp") or "—",
+        functie=(contract or {}).get("functie") or DEFAULT_FUNCTION,
+        discord_tag=display_tag(member) if member else f"ID {resignation['user_id']}",
+        discord_id=str(resignation["user_id"]),
+        data_angajarii=format_date_ro(join_date_iso) if join_date_iso else "—",
+        data_incetarii=format_date_ro(end_iso),
+        durata=format_duration_seconds(worked_seconds),
+        zile=format_days(worked_seconds // 86400 if worked_seconds is not None else None),
+        motiv=resignation.get("request_reason") or "Demisie la cerere.",
+        semnatura_angajat=member_signature,
+        semnatura_conducere=staff_signature,
+        grad_conducere=staff_grade,
+        conducere_discord=display_tag(staff),
+        city=CITY_NAME,
+        department=DEPARTMENT_NAME,
+        department_subtitle=DEPARTMENT_SUBTITLE,
+        logo_main=logo_main,
+        logo_ems=logo_ems,
+    )
+
+
+# =========================
+# VIEW + MODAL CONTRACT
+# =========================
+
+class ContractSignView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @classmethod
+    def disabled(cls) -> "ContractSignView":
+        view = cls()
+        for item in view.children:
+            item.disabled = True
+        return view
+
+    @discord.ui.button(
+        label="Semnează contractul",
+        style=discord.ButtonStyle.success,
+        custom_id=CONTRACT_SIGN_CUSTOM_ID,
+        emoji="✍️",
+    )
+    async def sign_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_signature_flow(interaction)
+
+
+class SemnaturaContractModal(discord.ui.Modal, title="Semnare contract Legacy EMS"):
+    def __init__(self, contract_id: str, default_name: str):
+        super().__init__(timeout=600)
+        self.contract_id = contract_id
+        self.semnatura = discord.ui.TextInput(
+            label="Semnătura ta (Nume și Prenume IC)",
+            placeholder="Exemplu: Andrei Popescu",
+            default=default_name[:60],
+            min_length=3,
+            max_length=60,
+            required=True,
+        )
+        self.add_item(self.semnatura)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            signature = validate_name(str(self.semnatura.value))
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await finalize_contract(interaction, self.contract_id, signature)
+
+
+async def start_signature_flow(interaction: discord.Interaction) -> None:
+    """Comun pentru `/semneaza` și butonul din mesajul contractului."""
+    if interaction.guild_id != MAIN_GUILD_ID:
+        await interaction.response.send_message(
+            "❌ Contractele se semnează doar pe serverul principal Legacy of CLT.",
+            ephemeral=True,
+        )
+        return
+
+    contract = await db.get_pending_contract(interaction.user.id)
+    if not contract:
+        active = await db.get_active_contract(interaction.user.id)
+        if active:
+            await interaction.response.send_message(
+                f"✅ Ai deja un contract semnat (`{active['id']}`) din "
+                f"**{format_dt(active.get('signed_at'))}**.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "❌ Nu ai niciun contract în așteptare.\n"
+            "Un membru al conducerii trebuie să folosească mai întâi `/contract` pentru tine.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(
+        SemnaturaContractModal(contract["id"], contract["nume_ic"])
+    )
+
+
+async def finalize_contract(interaction: discord.Interaction, contract_id: str, signature: str) -> None:
+    signed_at = now_local()
+    row = await db.sign_contract(contract_id, signature, signed_at.isoformat())
+    if not row:
+        await interaction.followup.send("❌ Contractul nu mai există în baza de date.", ephemeral=True)
+        return
+    if row["status"] != "SIGNED":
+        await interaction.followup.send(
+            f"⚠️ Contractul este deja **{status_ro(row['status']).lower()}**.", ephemeral=True
+        )
+        return
+
+    member = interaction.user
+    recruiter_id = int(row["recruiter_id"])
+    recruiter = bot.get_user(recruiter_id)
+    if recruiter is None:
+        try:
+            recruiter = await bot.fetch_user(recruiter_id)
+        except (discord.NotFound, discord.HTTPException):
+            recruiter = member
+
+    # Data și ora intrării se setează automat la momentul semnării.
+    await db.set_join_date(member.id, signed_at, recruiter_id)
+
+    try:
+        png = await build_contract_png(row, member, recruiter)
+    except Exception:  # noqa: BLE001
+        log.exception("Eroare la generarea contractului %s.", contract_id)
+        await interaction.followup.send(
+            "❌ Contractul a fost semnat, dar generarea imaginii a eșuat. Anunță un administrator.",
+            ephemeral=True,
+        )
+        return
+
+    embed = build_contract_signed_embed(row)
+
+    # 1. Canalul de contracte din serverul principal.
+    await send_to_channel(
+        CONTRACT_CHANNEL_ID,
+        content=f"📄 Contract finalizat pentru {member.mention} · angajat de {recruiter.mention}",
+        embed=embed,
+        file_payload=png,
+        filename="contract.png",
+    )
+
+    # 2. Canalul de contracte din serverul EMS.
+    await send_to_channel(
+        CONTRACT_LOG_CHANNEL_ID,
+        content=f"📄 Contract nou în {DEPARTMENT_NAME} · {member.mention}",
+        embed=build_contract_signed_embed(row),
+        file_payload=png,
+        filename="contract.png",
+    )
+
+    # 3. Dezactivează butonul din mesajul inițial.
+    if row.get("message_id"):
+        try:
+            channel = bot.get_channel(int(row["channel_id"])) or await bot.fetch_channel(int(row["channel_id"]))
+            if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                message = await channel.fetch_message(int(row["message_id"]))
+                await message.edit(view=ContractSignView.disabled())
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    # 4. Invitație în serverul EMS + document prin DM.
+    invite_url = await create_ems_invite(f"Angajare {row['nume_ic']} ({member.id})")
+    dm_lines = [
+        f"🎉 **Bun venit în {DEPARTMENT_NAME}, {row['nume_ic']}!**",
+        f"Contractul tău (`{row['id']}`) a fost semnat pe **{format_date_ro(row['signed_at'])}**.",
+    ]
+    if invite_url:
+        dm_lines.append(f"\n🔗 Intră pe serverul departamentului: {invite_url}")
+    dm_sent = await try_dm(
+        member.id,
+        content="\n".join(dm_lines),
+        file_payload=png,
+        filename="contract.png",
+    )
+
+    confirmation = [
+        f"✅ Contractul **{row['id']}** a fost semnat și generat.",
+        f"📅 Data intrării a fost setată automat: **{format_dt(row['signed_at'])}**.",
+    ]
+    if invite_url:
+        confirmation.append(f"🔗 Invitația ta în serverul {DEPARTMENT_NAME}: {invite_url}")
     else:
-        title = "📋 Cerere de Demisie"
-        color = discord.Color.orange()
-        status_line = "🟡 În așteptare"
+        confirmation.append(
+            "⚠️ Nu am putut genera invitația automat. Cere linkul conducerii."
+        )
+    if not dm_sent:
+        confirmation.append("⚠️ Nu am putut să-ți trimit DM. Salvează contractul din canal.")
 
-    embed = discord.Embed(
-        title=title,
-        description=f"Cererea de demisie pentru {user_mention(row['user_id'])} a fost actualizată.",
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="👤 Membru", value=f"{user_mention(row['user_id'])}\n`{row['user_id']}`", inline=True)
-    if row.get("request_name"):
-        embed.add_field(name="🪪 Nume", value=row["request_name"][:256], inline=True)
-    if row.get("request_hours"):
-        embed.add_field(name="⏱️ Ore", value=row["request_hours"][:256], inline=True)
-    embed.add_field(name="📅 Data intrării", value=format_join_date(row.get("join_date")), inline=True)
-    embed.add_field(name="⏳ Timp în departament", value=format_duration_from_join(row.get("join_date")), inline=True)
-    embed.add_field(name="📌 Status", value=status_line, inline=False)
-    if row.get("request_reason"):
-        embed.add_field(name="📝 Motiv", value=row["request_reason"][:1024], inline=False)
-
-    if row.get("decided_by"):
-        embed.add_field(name="👮 Decizie luată de", value=user_mention(row["decided_by"]), inline=True)
-    decided_ts = unix_from_iso(row.get("decided_at"))
-    if decided_ts:
-        embed.add_field(name="🕒 Data deciziei", value=f"<t:{decided_ts}:F>", inline=True)
-    if status == "REFUSED" and row.get("reason"):
-        embed.add_field(name="📝 Motivul refuzului", value=row["reason"][:1024], inline=False)
-
-    embed.add_field(name="⚠️ Roluri", value="Rolurile se elimină manual de către conducere.", inline=False)
-    embed.set_footer(text=f"ID cerere: {row['id']}")
-    return embed
-
-
-def build_main_accepted_embed(row: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title="📢 Demisie Acceptată",
-        description=(
-            f"{user_mention(row['user_id'])} a părăsit departamentul **Legacy EMS** "
-            f"după **{format_duration_from_join(row.get('join_date')).lower()}**."
-        ),
-        color=discord.Color.blue(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="👮 Acceptată de", value=user_mention(row.get("decided_by", "0")), inline=True)
-    if row.get("request_name"):
-        embed.add_field(name="🪪 Nume", value=row["request_name"][:256], inline=True)
-    if row.get("request_hours"):
-        embed.add_field(name="⏱️ Ore", value=row["request_hours"][:256], inline=True)
-    embed.add_field(name="📅 Data intrării", value=format_join_date(row.get("join_date")), inline=True)
-    if row.get("request_reason"):
-        embed.add_field(name="📝 Motiv", value=row["request_reason"][:1024], inline=False)
-    embed.set_footer(text="Legacy EMS • Departamentul Medical")
-    return embed
-
-
-def build_refused_public_embed(row: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title="❌ Demisie Refuzată",
-        description=f"{user_mention(row['user_id'])}, demisia ta a fost refuzată de către conducere.",
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="👮 Refuzată de", value=user_mention(row.get("decided_by", "0")), inline=True)
-    if row.get("request_name"):
-        embed.add_field(name="🪪 Nume", value=row["request_name"][:256], inline=True)
-    if row.get("request_hours"):
-        embed.add_field(name="⏱️ Ore", value=row["request_hours"][:256], inline=True)
-    if row.get("request_reason"):
-        embed.add_field(name="📝 Motiv", value=row["request_reason"][:1024], inline=False)
-    embed.add_field(name="📝 Motivul refuzului", value=(row.get("reason") or "Nespecificat")[:1024], inline=False)
-    embed.set_footer(text="Legacy EMS • Departamentul Medical")
-    return embed
+    await interaction.followup.send("\n".join(confirmation), ephemeral=True)
 
 
 # =========================
-# VIEW + MODAL
+# VIEW + MODAL DEMISIE
 # =========================
 
 class DemisieDecisionView(discord.ui.View):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self) -> None:
         super().__init__(timeout=None)
-        self.bot = bot
 
     @classmethod
-    def disabled(cls, bot: commands.Bot) -> "DemisieDecisionView":
-        view = cls(bot)
+    def disabled(cls) -> "DemisieDecisionView":
+        view = cls()
         for item in view.children:
             item.disabled = True
         return view
@@ -602,15 +843,26 @@ class DemisieDecisionView(discord.ui.View):
         if not row:
             await interaction.response.send_message("❌ Cererea nu există în baza de date.", ephemeral=True)
             return None
-
         if row["status"] != "PENDING":
             await interaction.response.send_message(
                 f"⚠️ Această cerere este deja **{status_ro(row['status']).lower()}**.",
                 ephemeral=True,
             )
             return None
-
         return row
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id != EMS_GUILD_ID:
+            await interaction.response.send_message(
+                "❌ Acest buton funcționează doar pe serverul EMS.", ephemeral=True
+            )
+            return False
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                "❌ Nu ai permisiune să gestionezi demisii.", ephemeral=True
+            )
+            return False
+        return True
 
     @discord.ui.button(
         label="Acceptă Demisia",
@@ -619,57 +871,20 @@ class DemisieDecisionView(discord.ui.View):
         emoji="✅",
     )
     async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild_id != EMS_GUILD_ID:
-            await interaction.response.send_message("❌ Acest buton funcționează doar pe serverul EMS.", ephemeral=True)
+        if not await self._guard(interaction):
             return
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("❌ Nu ai permisiune să accepți demisii.", ephemeral=True)
-            return
-
         row = await self._get_pending_request_or_reply(interaction)
         if not row:
             return
 
-        await interaction.response.defer(ephemeral=True)
+        default_signature = row.get("request_name") or ""
+        staff_contract = await db.get_last_contract(interaction.user.id)
+        if staff_contract and staff_contract.get("member_signature"):
+            default_signature = staff_contract["member_signature"]
 
-        join_date_iso = await db.get_join_date(int(row["user_id"])) or row.get("join_date")
-        days = calculate_days(join_date_iso)
-        if not is_valid_join_date(join_date_iso) or days is None:
-            await interaction.followup.send(
-                "❌ Nu pot accepta demisia deoarece data intrării membrului nu este setată corect.\n"
-                "Folosește mai întâi: `/setintrare @membru DD/MM/YYYY HH:MM` și apoi apasă din nou pe `Acceptă Demisia`.",
-                ephemeral=True,
-            )
-            return
-
-        updated = await db.decide(
-            int(row["message_id"]),
-            status="ACCEPTED",
-            decided_by=interaction.user.id,
-            reason=None,
-            join_date_iso=join_date_iso,
-            days=days,
+        await interaction.response.send_modal(
+            AcceptDemisieModal(int(row["message_id"]), default_signature)
         )
-        if not updated or updated["status"] != "ACCEPTED":
-            await interaction.followup.send("⚠️ Cererea nu mai este în așteptare.", ephemeral=True)
-            return
-
-        try:
-            await interaction.message.edit(embed=build_decision_embed(updated), view=DemisieDecisionView.disabled(self.bot))
-        except discord.HTTPException:
-            log.exception("Nu am putut edita mesajul cererii acceptate.")
-
-        await send_to_channel(self.bot, EMS_LOG_CHANNEL_ID, embed=build_decision_embed(updated))
-        await send_to_channel(self.bot, MAIN_LOG_CHANNEL_ID, embed=build_main_accepted_embed(updated))
-
-        # DM optional către membru. Dacă are DM închis, se ignoră.
-        try:
-            user = self.bot.get_user(int(updated["user_id"])) or await self.bot.fetch_user(int(updated["user_id"]))
-            await user.send(embed=build_decision_embed(updated))
-        except discord.HTTPException:
-            pass
-
-        await interaction.followup.send("✅ Demisia a fost acceptată. Logurile au fost trimise.", ephemeral=True)
 
     @discord.ui.button(
         label="Refuză Demisia",
@@ -678,18 +893,53 @@ class DemisieDecisionView(discord.ui.View):
         emoji="❌",
     )
     async def refuse_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.guild_id != EMS_GUILD_ID:
-            await interaction.response.send_message("❌ Acest buton funcționează doar pe serverul EMS.", ephemeral=True)
+        if not await self._guard(interaction):
             return
-        if not is_staff(interaction.user):
-            await interaction.response.send_message("❌ Nu ai permisiune să refuzi demisii.", ephemeral=True)
-            return
-
         row = await self._get_pending_request_or_reply(interaction)
         if not row:
             return
+        await interaction.response.send_modal(RefuzDemisieModal(int(row["message_id"])))
 
-        await interaction.response.send_modal(RefuzDemisieModal(self.bot, int(row["message_id"])))
+
+class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
+    def __init__(self, message_id: int, default_signature: str):
+        super().__init__(timeout=600)
+        self.message_id = message_id
+        self.semnatura = discord.ui.TextInput(
+            label="Semnătura ta (Nume și Prenume IC)",
+            placeholder="Exemplu: Mihai Ionescu",
+            default=default_signature[:60] if default_signature else None,
+            min_length=3,
+            max_length=60,
+            required=True,
+        )
+        self.observatii = discord.ui.TextInput(
+            label="Observații (opțional)",
+            placeholder="Apare pe decizia de încetare, sub motivul demisiei.",
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+            required=False,
+        )
+        self.add_item(self.semnatura)
+        self.add_item(self.observatii)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("❌ Nu ai permisiune să accepți demisii.", ephemeral=True)
+            return
+        try:
+            signature = validate_name(str(self.semnatura.value))
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await finalize_termination(
+            interaction,
+            self.message_id,
+            signature,
+            clean_line(str(self.observatii.value or "")),
+        )
 
 
 class RefuzDemisieModal(discord.ui.Modal, title="Refuz Demisie"):
@@ -702,9 +952,8 @@ class RefuzDemisieModal(discord.ui.Modal, title="Refuz Demisie"):
         required=True,
     )
 
-    def __init__(self, bot: commands.Bot, message_id: int):
+    def __init__(self, message_id: int):
         super().__init__(timeout=300)
-        self.bot = bot
         self.message_id = message_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -718,46 +967,185 @@ class RefuzDemisieModal(discord.ui.Modal, title="Refuz Demisie"):
             return
         if row["status"] != "PENDING":
             await interaction.response.send_message(
-                f"⚠️ Această cerere este deja **{status_ro(row['status']).lower()}**.",
-                ephemeral=True,
+                f"⚠️ Această cerere este deja **{status_ro(row['status']).lower()}**.", ephemeral=True
             )
             return
 
-        join_date_iso = await db.get_join_date(int(row["user_id"])) or row.get("join_date")
-        days = calculate_days(join_date_iso)
         updated = await db.decide(
             self.message_id,
             status="REFUSED",
             decided_by=interaction.user.id,
             reason=str(self.motiv.value).strip(),
-            join_date_iso=join_date_iso,
-            days=days,
+            join_date_iso=row.get("join_date"),
+            days=None,
         )
-
         if not updated or updated["status"] != "REFUSED":
             await interaction.response.send_message("⚠️ Cererea nu mai este în așteptare.", ephemeral=True)
             return
 
-        await interaction.response.send_message("❌ Demisia a fost refuzată. Mesajele au fost trimise.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ Demisia a fost refuzată. Mesajele au fost trimise.", ephemeral=True
+        )
 
         try:
             channel = interaction.channel
-            if not isinstance(channel, discord.TextChannel):
-                channel = self.bot.get_channel(int(row["channel_id"])) or await self.bot.fetch_channel(int(row["channel_id"]))
-            original_message = await channel.fetch_message(self.message_id)
-            await original_message.edit(embed=build_decision_embed(updated), view=DemisieDecisionView.disabled(self.bot))
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                channel = bot.get_channel(int(row["channel_id"])) or await bot.fetch_channel(int(row["channel_id"]))
+            original = await channel.fetch_message(self.message_id)
+            await original.edit(embed=build_decision_embed(updated), view=DemisieDecisionView.disabled())
             await channel.send(embed=build_refused_public_embed(updated))
-        except discord.HTTPException:
-            log.exception("Nu am putut edita/trimitere mesaj pentru demisia refuzată.")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            log.exception("Nu am putut actualiza mesajul demisiei refuzate.")
 
-        await send_to_channel(self.bot, EMS_LOG_CHANNEL_ID, embed=build_decision_embed(updated))
+        await send_to_channel(EMS_LOG_CHANNEL_ID, embed=build_decision_embed(updated))
+        await try_dm(int(updated["user_id"]), embed=build_refused_public_embed(updated))
 
-        # DM optional către membru. Dacă are DM închis, se ignoră.
+
+async def finalize_termination(
+    interaction: discord.Interaction,
+    message_id: int,
+    staff_signature: str,
+    observatii: str,
+) -> None:
+    row = await db.get_by_message_id(message_id)
+    if not row:
+        await interaction.followup.send("❌ Cererea nu există în baza de date.", ephemeral=True)
+        return
+    if row["status"] != "PENDING":
+        await interaction.followup.send(
+            f"⚠️ Această cerere este deja **{status_ro(row['status']).lower()}**.", ephemeral=True
+        )
+        return
+
+    user_id = int(row["user_id"])
+    ems_member = await fetch_ems_member(user_id)
+    join_date_iso = await resolve_join_date(user_id, ems_member) or row.get("join_date")
+    end_dt = now_local()
+    end_iso = end_dt.isoformat()
+    worked_seconds = duration_seconds_between(join_date_iso, end_iso)
+    days = worked_seconds // 86400 if worked_seconds is not None else None
+
+    updated = await db.decide(
+        message_id,
+        status="ACCEPTED",
+        decided_by=interaction.user.id,
+        reason=observatii or None,
+        join_date_iso=join_date_iso,
+        days=days,
+    )
+    if not updated or updated["status"] != "ACCEPTED":
+        await interaction.followup.send("⚠️ Cererea nu mai este în așteptare.", ephemeral=True)
+        return
+
+    contract = await db.get_active_contract(user_id) or await db.get_last_contract(user_id)
+    staff_grade = top_role_name(interaction.user)
+    document_id = new_document_id("DEM")
+
+    if observatii:
+        updated = dict(updated)
+        updated["request_reason"] = f"{updated.get('request_reason') or ''}\n\nObservații conducere: {observatii}".strip()
+
+    member_user = bot.get_user(user_id) or ems_member
+    if member_user is None:
         try:
-            user = self.bot.get_user(int(updated["user_id"])) or await self.bot.fetch_user(int(updated["user_id"]))
-            await user.send(embed=build_refused_public_embed(updated))
-        except discord.HTTPException:
-            pass
+            member_user = await bot.fetch_user(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            member_user = None
+
+    png: Optional[bytes] = None
+    try:
+        png = await build_termination_png(
+            document_id=document_id,
+            contract=contract,
+            resignation=updated,
+            member=member_user,
+            staff=interaction.user,
+            staff_signature=staff_signature,
+            staff_grade=staff_grade,
+            join_date_iso=join_date_iso,
+            end_iso=end_iso,
+            worked_seconds=worked_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Eroare la generarea deciziei de încetare %s.", document_id)
+
+    if contract and contract["status"] == "SIGNED":
+        await db.terminate_contract(
+            contract["id"],
+            terminated_by=interaction.user.id,
+            terminated_signature=staff_signature,
+            terminated_grade=staff_grade,
+            terminated_reason=updated.get("request_reason") or "Demisie la cerere.",
+            terminated_at_iso=end_iso,
+            worked_seconds=worked_seconds,
+        )
+
+    durata = format_duration_seconds(worked_seconds)
+    zile = format_days(days)
+    decision_embed = build_decision_embed(updated)
+
+    # Mesajul original din canalul de demisii.
+    try:
+        channel = interaction.channel
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            channel = bot.get_channel(int(updated["channel_id"])) or await bot.fetch_channel(int(updated["channel_id"]))
+        original = await channel.fetch_message(message_id)
+        await original.edit(embed=decision_embed, view=DemisieDecisionView.disabled())
+        if png:
+            await channel.send(
+                content=f"📕 Decizie de încetare pentru {user_mention(user_id)}",
+                file=make_file(png, "demisie.png"),
+            )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.exception("Nu am putut actualiza mesajul demisiei acceptate.")
+
+    if png:
+        termination_embed = build_termination_embed(contract, updated, durata, zile)
+        await send_to_channel(
+            CONTRACT_LOG_CHANNEL_ID,
+            content=f"📕 Încetare contract · {user_mention(user_id)}",
+            embed=termination_embed,
+            file_payload=png,
+            filename="demisie.png",
+        )
+        await send_to_channel(
+            EMS_LOG_CHANNEL_ID,
+            embed=build_termination_embed(contract, updated, durata, zile),
+            file_payload=png,
+            filename="demisie.png",
+        )
+        await send_to_channel(
+            MAIN_LOG_CHANNEL_ID,
+            content=(
+                f"📢 {user_mention(user_id)} a părăsit **{DEPARTMENT_NAME}** după **{durata}**."
+            ),
+            embed=build_termination_embed(contract, updated, durata, zile),
+            file_payload=png,
+            filename="demisie.png",
+        )
+        await try_dm(
+            user_id,
+            content=(
+                f"📕 Demisia ta din **{DEPARTMENT_NAME}** a fost acceptată.\n"
+                f"📅 Data intrării: **{format_dt(join_date_iso)}**\n"
+                f"📅 Data încetării: **{format_dt(end_iso)}**\n"
+                f"⏳ Perioadă lucrată: **{durata}**"
+            ),
+            file_payload=png,
+            filename="demisie.png",
+        )
+    else:
+        await send_to_channel(EMS_LOG_CHANNEL_ID, embed=decision_embed)
+        await send_to_channel(MAIN_LOG_CHANNEL_ID, embed=decision_embed)
+
+    summary = [
+        f"✅ Demisia a fost acceptată. Perioadă lucrată: **{durata}** ({zile}).",
+    ]
+    if png:
+        summary.append("📕 Decizia de încetare a fost generată și trimisă.")
+    else:
+        summary.append("⚠️ Nu am putut genera imaginea deciziei. Logurile text au fost trimise.")
+    await interaction.followup.send("\n".join(summary), ephemeral=True)
 
 
 # =========================
@@ -770,41 +1158,36 @@ intents.messages = True
 intents.message_content = True
 intents.members = True
 
-REQUIRED_IDS = {
-    "MAIN_GUILD_ID": MAIN_GUILD_ID,
-    "EMS_GUILD_ID": EMS_GUILD_ID,
-    "DEMISIE_CHANNEL_ID": DEMISIE_CHANNEL_ID,
-    "EMS_LOG_CHANNEL_ID": EMS_LOG_CHANNEL_ID,
-    "MAIN_LOG_CHANNEL_ID": MAIN_LOG_CHANNEL_ID,
-}
-
-
-def validate_config_startup() -> None:
-    missing = [name for name, value in REQUIRED_IDS.items() if not value]
-    if missing:
-        raise RuntimeError(
-            "Lipsesc ID-uri obligatorii în Railway Variables / .env: " + ", ".join(missing)
-        )
-    if not STAFF_ROLE_IDS:
-        raise RuntimeError("Lipsește STAFF_ROLE_IDS. Adaugă ID-urile rolurilor staff, separate prin virgulă.")
-
 
 class LegacyEMSBot(commands.Bot):
     async def setup_hook(self) -> None:
-        self.add_view(DemisieDecisionView(self))
+        self.add_view(ContractSignView())
+        self.add_view(DemisieDecisionView())
+
+        # Comenzile vechi (/setintrare, /intrare, /demisii) erau înregistrate pe
+        # serverul EMS și global. Le ștergem explicit.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
+
         ems_guild = discord.Object(id=EMS_GUILD_ID)
-        synced = await self.tree.sync(guild=ems_guild)
-        log.info("Slash commands sincronizate pe serverul EMS: %s", len(synced))
+        self.tree.clear_commands(guild=ems_guild)
+        await self.tree.sync(guild=ems_guild)
+
+        synced = await self.tree.sync(guild=discord.Object(id=MAIN_GUILD_ID))
+        log.info(
+            "Comenzi sincronizate pe serverul principal: %s",
+            ", ".join(command.name for command in synced) or "niciuna",
+        )
 
 
 bot = LegacyEMSBot(command_prefix=BOT_PREFIX, intents=intents)
+main_guild_obj = discord.Object(id=MAIN_GUILD_ID)
 
 
 @bot.event
 async def on_ready() -> None:
     log.info("Bot online ca %s | Servere: %s", bot.user, len(bot.guilds))
-    log.info("Versiune bot: %s", BOT_VERSION)
-    log.info("DB_PATH: %s", DB_PATH)
+    log.info("Versiune bot: %s | DB: %s", BOT_VERSION, DB_PATH)
 
 
 @bot.event
@@ -816,7 +1199,9 @@ async def on_message(message: discord.Message) -> None:
 
     if not message.guild or message.guild.id != EMS_GUILD_ID:
         return
-    if message.channel.id != DEMISIE_CHANNEL_ID:
+    if not DEMISIE_CHANNEL_ID or message.channel.id != DEMISIE_CHANNEL_ID:
+        return
+    if not isinstance(message.author, discord.Member):
         return
 
     looks_like_demisie = bool(
@@ -826,59 +1211,56 @@ async def on_message(message: discord.Message) -> None:
     if not looks_like_demisie:
         return
 
-    parsed_template = parse_demisie_template(message.content)
-    if not parsed_template:
+    parsed = parse_demisie_template(message.content)
+    if not parsed:
         await message.reply(demisie_format_message(), mention_author=True)
         return
 
-    request_name, request_hours, request_reason = parsed_template
-
+    request_name, request_hours, request_reason = parsed
+    problems = []
     if len(request_name) < 2:
-        await message.reply("⚠️ Câmpul `Nume` trebuie completat corect.", mention_author=True)
-        return
-    if len(request_name) > 100:
-        await message.reply("⚠️ Câmpul `Nume` este prea lung. Maxim 100 de caractere.", mention_author=True)
-        return
-    if len(request_hours) < 1:
-        await message.reply("⚠️ Câmpul `Ore` trebuie completat.", mention_author=True)
-        return
-    if len(request_hours) > 30:
-        await message.reply("⚠️ Câmpul `Ore` este prea lung. Maxim 30 de caractere.", mention_author=True)
-        return
+        problems.append("Câmpul `Nume` trebuie completat corect.")
+    elif len(request_name) > 100:
+        problems.append("Câmpul `Nume` este prea lung. Maxim 100 de caractere.")
+    if not request_hours:
+        problems.append("Câmpul `Ore` trebuie completat.")
+    elif len(request_hours) > 30:
+        problems.append("Câmpul `Ore` este prea lung. Maxim 30 de caractere.")
     if len(request_reason) < 3:
-        await message.reply("⚠️ Câmpul `Motiv` trebuie completat corect.", mention_author=True)
-        return
-    if len(request_reason) > 1000:
-        await message.reply("⚠️ Câmpul `Motiv` este prea lung. Maxim 1000 de caractere.", mention_author=True)
-        return
-
-    if not isinstance(message.author, discord.Member):
+        problems.append("Câmpul `Motiv` trebuie completat corect.")
+    elif len(request_reason) > 1000:
+        problems.append("Câmpul `Motiv` este prea lung. Maxim 1000 de caractere.")
+    if problems:
+        await message.reply("⚠️ " + "\n⚠️ ".join(problems), mention_author=True)
         return
 
     existing = await db.get_pending_for_user(message.author.id)
     if existing:
         await message.reply(
-            f"⚠️ Ai deja o cerere de demisie în așteptare: https://discord.com/channels/{EMS_GUILD_ID}/{existing['channel_id']}/{existing['message_id']}",
+            "⚠️ Ai deja o cerere de demisie în așteptare: "
+            f"https://discord.com/channels/{EMS_GUILD_ID}/{existing['channel_id']}/{existing['message_id']}",
             mention_author=True,
         )
         return
 
-    join_date_iso = await db.get_join_date(message.author.id)
-    days = calculate_days(join_date_iso)
-    if not is_valid_join_date(join_date_iso) or days is None:
+    join_date_iso = await resolve_join_date(message.author.id, message.author)
+    if not join_date_iso:
         await message.reply(
-            "❌ Nu poți depune demisia deoarece **data intrării tale nu este setată corect**.\n"
-            "Roagă conducerea să folosească mai întâi comanda:\n"
-            "`/setintrare @membru DD/MM/YYYY HH:MM`\n\n"
-            "După ce data este setată, trimite din nou demisia.",
+            "❌ Nu pot determina data intrării tale în departament. Anunță conducerea.",
             mention_author=True,
         )
         return
 
-    request_id = f"DMS-{message.author.id}-{int(datetime.now(timezone.utc).timestamp())}"
+    contract = await db.get_active_contract(message.author.id)
+    request_id = new_document_id("DMS")
+    seconds = duration_seconds_between(join_date_iso)
 
-    embed = build_pending_embed(message.author, request_id, join_date_iso, days, request_reason, request_name, request_hours)
-    sent = await message.channel.send(embed=embed, view=DemisieDecisionView(bot))
+    sent = await message.channel.send(
+        embed=build_pending_embed(
+            message.author, request_id, join_date_iso, request_reason, request_name, request_hours
+        ),
+        view=DemisieDecisionView(),
+    )
 
     await db.create_resignation(
         request_id=request_id,
@@ -886,10 +1268,11 @@ async def on_message(message: discord.Message) -> None:
         channel_id=message.channel.id,
         message_id=sent.id,
         join_date_iso=join_date_iso,
-        days=days,
+        days=seconds // 86400 if seconds is not None else None,
         request_reason=request_reason,
         request_name=request_name,
         request_hours=request_hours,
+        contract_id=contract["id"] if contract else None,
     )
 
     if DELETE_TRIGGER_MESSAGE:
@@ -900,72 +1283,123 @@ async def on_message(message: discord.Message) -> None:
 
 
 # =========================
-# SLASH COMMANDS STAFF
+# SLASH COMMANDS
 # =========================
 
-ems_guild_obj = discord.Object(id=EMS_GUILD_ID)
-
-
-@bot.tree.command(name="setintrare", description="Setează data și ora intrării unui membru în Legacy EMS.", guild=ems_guild_obj)
-@app_commands.describe(
-    membru="Membrul pentru care setezi data intrării.",
-    data="Data intrării: YYYY-MM-DD sau DD/MM/YYYY.",
-    ora="Ora intrării: HH:MM, exemplu 20:30.",
+@bot.tree.command(
+    name="contract",
+    description="Emite un contract de angajare în Legacy EMS pentru un membru.",
+    guild=main_guild_obj,
 )
-async def setintrare(interaction: discord.Interaction, membru: discord.Member, data: str, ora: str):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("❌ Nu ai permisiune să folosești această comandă.", ephemeral=True)
+@app_commands.describe(
+    user="Membrul care este angajat.",
+    nume_ic="Numele și prenumele IC al membrului angajat.",
+    cnp="CNP-ul IC al membrului angajat.",
+    semnatura="Semnătura ta: numele și prenumele tău IC (angajatorul).",
+    functie="Funcția pe care este angajat (opțional).",
+)
+async def contract_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    nume_ic: str,
+    cnp: str,
+    semnatura: str,
+    functie: Optional[str] = None,
+):
+    if interaction.guild_id != MAIN_GUILD_ID:
+        await interaction.response.send_message(
+            "❌ Această comandă funcționează doar pe serverul principal Legacy of CLT.", ephemeral=True
+        )
         return
+    if not channel_matches(interaction.channel, CONTRACT_CHANNEL_ID):
+        await interaction.response.send_message(
+            f"❌ Folosește această comandă doar în <#{CONTRACT_CHANNEL_ID}>.", ephemeral=True
+        )
+        return
+    if not is_recruiter(interaction.user):
+        await interaction.response.send_message(
+            "❌ Nu ai permisiune să emiți contracte de angajare.", ephemeral=True
+        )
+        return
+    if user.bot:
+        await interaction.response.send_message("❌ Nu poți angaja un bot.", ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(
+            "❌ Nu poți emite un contract pentru tine însuți.", ephemeral=True
+        )
+        return
+
     try:
-        parsed = parse_join_datetime(data, ora)
+        nume_ic_clean = validate_name(nume_ic)
+        semnatura_clean = validate_name(semnatura)
+        cnp_clean = validate_cnp(cnp)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
 
-    await db.set_join_date(membru.id, parsed, interaction.user.id)
-    await interaction.response.send_message(
-        f"✅ Data și ora intrării pentru {membru.mention} au fost setate la **{parsed.strftime('%d/%m/%Y %H:%M')}**.\n"
-        f"⏳ Timp în departament acum: **{format_duration_from_join(parsed.isoformat())}**.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="intrare", description="Verifică data intrării unui membru în Legacy EMS.", guild=ems_guild_obj)
-@app_commands.describe(membru="Membrul verificat.")
-async def intrare(interaction: discord.Interaction, membru: discord.Member):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("❌ Nu ai permisiune să folosești această comandă.", ephemeral=True)
-        return
-
-    join_date_iso = await db.get_join_date(membru.id)
-    await interaction.response.send_message(
-        f"👤 {membru.mention}\n📅 Data intrării: **{format_join_date(join_date_iso)}**\n⏳ Timp în departament: **{format_duration_from_join(join_date_iso)}**",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="demisii", description="Afișează ultimele cereri de demisie.", guild=ems_guild_obj)
-@app_commands.describe(limit="Număr de cereri afișate, maxim 10.")
-async def demisii(interaction: discord.Interaction, limit: Optional[int] = 10):
-    if not is_staff(interaction.user):
-        await interaction.response.send_message("❌ Nu ai permisiune să folosești această comandă.", ephemeral=True)
-        return
-
-    limit = max(1, min(limit or 10, 10))
-    rows = await db.get_recent_resignations(limit)
-    if not rows:
-        await interaction.response.send_message("Nu există cereri de demisie înregistrate.", ephemeral=True)
-        return
-
-    lines = []
-    for row in rows:
-        created_ts = unix_from_iso(row.get("created_at"))
-        created_text = f"<t:{created_ts}:R>" if created_ts else "dată necunoscută"
-        lines.append(
-            f"• {user_mention(row['user_id'])} — **{status_ro(row['status'])}** — {created_text}"
+    functie_clean = clean_line(functie or "") or DEFAULT_FUNCTION
+    if len(functie_clean) > 60:
+        await interaction.response.send_message(
+            "❌ Funcția este prea lungă. Maxim 60 de caractere.", ephemeral=True
         )
+        return
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    active = await db.get_active_contract(user.id)
+    if active:
+        await interaction.response.send_message(
+            f"⚠️ {user.mention} are deja un contract activ (`{active['id']}`) din "
+            f"**{format_dt(active.get('signed_at'))}**.\n"
+            "Contractul trebuie încetat prin demisie înainte de a emite unul nou.",
+            ephemeral=True,
+        )
+        return
+
+    contract_id = new_document_id("CTR")
+    row = await db.create_contract(
+        contract_id=contract_id,
+        user_id=user.id,
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        nume_ic=nume_ic_clean,
+        cnp=cnp_clean,
+        functie=functie_clean,
+        recruiter_id=interaction.user.id,
+        recruiter_signature=semnatura_clean,
+        recruiter_grade=top_role_name(interaction.user),
+    )
+
+    # Fără defer, ca mențiunea membrului să genereze o notificare reală.
+    await interaction.response.send_message(
+        content=(
+            f"{user.mention} — ai un contract de angajare în **{DEPARTMENT_NAME}** de semnat.\n"
+            "Scrie **`/semneaza`** sau apasă butonul de mai jos."
+        ),
+        embed=build_contract_pending_embed(row, user, interaction.user),
+        view=ContractSignView(),
+        allowed_mentions=discord.AllowedMentions(users=[user]),
+    )
+    message = await interaction.original_response()
+    await db.set_contract_message(contract_id, message.id)
+
+
+@bot.tree.command(
+    name="semneaza",
+    description="Semnează contractul tău de angajare în Legacy EMS.",
+    guild=main_guild_obj,
+)
+async def semneaza_command(interaction: discord.Interaction):
+    await start_signature_flow(interaction)
+
+
+@contract_command.error
+async def contract_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    log.exception("Eroare în /contract: %s", error)
+    payload = "❌ A apărut o eroare la emiterea contractului. Încearcă din nou."
+    if interaction.response.is_done():
+        await interaction.followup.send(payload, ephemeral=True)
+    else:
+        await interaction.response.send_message(payload, ephemeral=True)
 
 
 if __name__ == "__main__":
