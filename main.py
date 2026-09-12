@@ -362,45 +362,85 @@ async def fetch_ems_member(user_id: int) -> Optional[discord.Member]:
 # EMBED-URI CONTRACT
 # =========================
 
-def build_contract_pending_embed(row: dict, member: discord.abc.User, recruiter: discord.abc.User) -> discord.Embed:
+def build_contract_card(
+    row: dict,
+    *,
+    title: str,
+    description: str,
+    color: discord.Color,
+    status: str,
+) -> discord.Embed:
+    """Cardul contractului, construit doar din rândul din baza de date.
+
+    Folosit atât pentru mesajul cu butoane, cât și pentru editarea lui după
+    ce angajatul a acceptat sau a refuzat.
+    """
     embed = discord.Embed(
+        title=title,
+        description=description,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="👤 Membru",
+        value=f"{user_mention(row['user_id'])}\n`{row['user_id']}`",
+        inline=True,
+    )
+    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
+    embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
+    embed.add_field(name="🎖️ Grad acordat", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(
+        name="✍️ Angajator",
+        value=f"{user_mention(row['recruiter_id'])}\n{row['recruiter_signature']}",
+        inline=True,
+    )
+    embed.add_field(name="🎖️ Grad angajator", value=row["recruiter_grade"], inline=True)
+    embed.add_field(name="📌 Status", value=status, inline=False)
+    embed.set_footer(text=f"ID contract: {row['id']}")
+    return embed
+
+
+def build_contract_pending_embed(row: dict) -> discord.Embed:
+    return build_contract_card(
+        row,
         title="📄 Contract de angajare în așteptare",
         description=(
-            f"{member.mention}, ai primit un contract de angajare în **{DEPARTMENT_NAME}**.\n\n"
+            f"{user_mention(row['user_id'])}, ai primit un contract de angajare în "
+            f"**{DEPARTMENT_NAME}**.\n\n"
             "Apasă **✍️ Acceptă / Semnează** pentru a semna contractul sau "
             "**❌ Refuză contractul** dacă nu ești de acord. Nu trebuie să scrii nimic.\n"
             "Contractul devine valabil **doar după ce îl accepți tu**."
         ),
         color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc),
+        status="🟡 Așteaptă răspunsul angajatului",
     )
-    embed.add_field(name="👤 Membru", value=f"{member.mention}\n`{member.id}`", inline=True)
-    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
-    embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
-    embed.add_field(name="🎖️ Grad acordat", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
-    embed.add_field(name="✍️ Angajator", value=f"{recruiter.mention}\n{row['recruiter_signature']}", inline=True)
-    embed.add_field(name="🎖️ Grad angajator", value=row["recruiter_grade"], inline=True)
-    embed.add_field(name="📌 Status", value="🟡 Așteaptă răspunsul angajatului", inline=False)
-    embed.set_footer(text=f"ID contract: {row['id']}")
-    return embed
 
 
-def build_contract_refused_embed(row: dict, member: discord.abc.User) -> discord.Embed:
-    embed = discord.Embed(
+def build_contract_accepted_card(row: dict) -> discord.Embed:
+    return build_contract_card(
+        row,
+        title="✅ Contract acceptat și semnat",
+        description=(
+            f"{user_mention(row['user_id'])} a acceptat contractul. "
+            "Documentul semnat este postat mai jos."
+        ),
+        color=discord.Color.green(),
+        status="🟢 Semnat de angajat",
+    )
+
+
+def build_contract_refused_embed(row: dict) -> discord.Embed:
+    return build_contract_card(
+        row,
         title="❌ Contract refuzat",
         description=(
-            f"{member.mention} a refuzat contractul de angajare în **{DEPARTMENT_NAME}**.\n"
-            "Contractul nu a intrat în vigoare și nu a fost setată nicio dată de intrare."
+            f"{user_mention(row['user_id'])} a refuzat contractul de angajare în "
+            f"**{DEPARTMENT_NAME}**.\nContractul nu a intrat în vigoare și nu a fost "
+            "setată nicio dată de intrare."
         ),
         color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc),
+        status="🔴 Refuzat de angajat",
     )
-    embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
-    embed.add_field(name="🎖️ Grad propus", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
-    embed.add_field(name="✍️ Emis de", value=user_mention(row["recruiter_id"]), inline=True)
-    embed.add_field(name="📌 Status", value="🔴 Refuzat de angajat", inline=False)
-    embed.set_footer(text=f"ID contract: {row['id']}")
-    return embed
 
 
 def build_contract_signed_embed(row: dict) -> discord.Embed:
@@ -760,14 +800,15 @@ async def refuse_contract(interaction: discord.Interaction, contract: dict) -> N
         )
         return
 
-    embed = build_contract_refused_embed(updated, interaction.user)
-    await update_contract_message(updated, embed)
+    await update_contract_message(updated, build_contract_refused_embed(updated))
 
     recruiter_mention = user_mention(updated["recruiter_id"])
     await send_to_channel(
         CONTRACT_CHANNEL_ID,
-        content=f"❌ {recruiter_mention} — {interaction.user.mention} a refuzat contractul `{updated['id']}`.",
-        embed=build_contract_refused_embed(updated, interaction.user),
+        content=(
+            f"❌ {recruiter_mention} — {interaction.user.mention} a refuzat contractul "
+            f"`{updated['id']}` pentru **{updated['nume_ic']}**."
+        ),
     )
     await try_dm(
         int(updated["recruiter_id"]),
@@ -853,7 +894,7 @@ async def finalize_contract(interaction: discord.Interaction, contract_id: str, 
     )
 
     # 3. Dezactivează butonul din mesajul inițial.
-    await update_contract_message(row)
+    await update_contract_message(row, build_contract_accepted_card(row))
 
     # 4. Invitație în serverul EMS + document prin DM.
     invite_url = await create_ems_invite(f"Angajare {row['nume_ic']} ({member.id})")
@@ -1458,7 +1499,7 @@ async def contract_command(
             f"{user.mention} — ai un contract de angajare în **{DEPARTMENT_NAME}**.\n"
             "Apasă un buton de mai jos: **Acceptă / Semnează** sau **Refuză contractul**."
         ),
-        embed=build_contract_pending_embed(row, user, interaction.user),
+        embed=build_contract_pending_embed(row),
         view=ContractDecisionView(),
         allowed_mentions=discord.AllowedMentions(users=[user]),
     )
