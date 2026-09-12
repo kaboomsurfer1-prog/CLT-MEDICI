@@ -575,7 +575,7 @@ def render_contract(
             ("Nume și prenume", nume_ic),
             ("CNP", cnp),
             ("Departament", f"{department} · {department_subtitle}"),
-            ("Funcția", functie),
+            ("Gradul acordat", functie),
             ("Data și ora angajării", data_angajarii),
             ("Cont Discord", discord_tag),
         ],
@@ -588,7 +588,7 @@ def render_contract(
         y,
         content_width,
         [
-            f"Angajatul este încadrat în {department} ({department_subtitle}) al orașului {city}, pe funcția de {functie}, "
+            f"Angajatul este încadrat în {department} ({department_subtitle}) al orașului {city}, cu gradul de {functie}, "
             "începând cu data menționată mai sus.",
             "Angajatul se obligă să respecte regulamentul intern al departamentului, ordinele conducerii, "
             "protocoalele medicale și regulamentul general al serverului.",
@@ -719,7 +719,7 @@ def render_termination(
         [
             ("Nume și prenume", nume_ic),
             ("CNP", cnp),
-            ("Funcția deținută", functie),
+            ("Gradul deținut", functie),
             ("Cont Discord", discord_tag),
             ("Data intrării în departament", data_angajarii),
             ("Data încetării activității", data_incetarii),

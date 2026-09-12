@@ -20,18 +20,21 @@ Versiune: `2.0.0-legacy-ems-contracte`
 `1517181051288420372` folosește:
 
 ```text
-/contract user:@membru nume_ic:Andrei Popescu cnp:1980512345678 semnatura:Mihai Ionescu
+/contract user:@membru nume_ic:Andrei Popescu cnp:1980512345678
+          semnatura:Mihai Ionescu grad_angajator:Director Medical
+          grad_angajat:Paramedic Nivel 2
 ```
 
-| Câmp | Obligatoriu | Ce se scrie |
-| --- | --- | --- |
-| `user` | da | membrul care este angajat |
-| `nume_ic` | da | numele și prenumele IC al celui angajat |
-| `cnp` | da | CNP-ul IC al celui angajat |
-| `semnatura` | da | **numele și prenumele IC al celui care angajează** |
-| `functie` | nu | funcția pe care este angajat (implicit `Paramedic Stagiar`) |
+Toate câmpurile sunt **obligatorii**:
 
-Gradul angajatorului este preluat automat din **cel mai înalt rol Discord** al acestuia.
+| Câmp | Ce se scrie |
+| --- | --- |
+| `user` | membrul care este angajat |
+| `nume_ic` | numele și prenumele IC al celui angajat |
+| `cnp` | CNP-ul IC al celui angajat |
+| `semnatura` | numele și prenumele IC al celui care angajează |
+| `grad_angajator` | gradul celui care face contractul |
+| `grad_angajat` | gradul pe care îl primește membrul angajat |
 
 Botul postează un mesaj care taghează membrul și îi cere să semneze.
 
@@ -50,7 +53,7 @@ scrie semnătura (nume și prenume IC).
 
 1. Generează **contractul ca imagine** (A4, în română) cu:
    - logo-ul orașului și logo-ul EMS
-   - datele angajatului (nume IC, CNP, funcție, cont Discord)
+   - datele angajatului (nume IC, CNP, gradul acordat, cont Discord)
    - clauzele contractuale
    - **semnătura angajatorului + gradul lui** și **semnătura angajatului**
    - ștampila oficială a departamentului
@@ -74,8 +77,9 @@ Motiv: Nu mai am timp să activez în departament.
 
 Conducerea primește butoane:
 
-- **✅ Acceptă Demisia** → cere semnătura conducerii, apoi generează
-  **Decizia de Încetare a Contractului** (imagine) cu:
+- **✅ Acceptă Demisia** → cere **semnătura și gradul** celui din conducere
+  (gradul vine precompletat cu cel mai înalt rol Discord al lui, dar poate fi
+  schimbat), apoi generează **Decizia de Încetare a Contractului** (imagine) cu:
   - textul că persoana **nu mai face parte din departamentul EMS**
   - data intrării, data încetării, perioada lucrată (zile, ore, minute) și totalul de zile
   - semnătura conducerii cu gradul ei și semnătura fostului angajat

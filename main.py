@@ -74,6 +74,7 @@ from utils import (
     unix_from_iso,
     user_mention,
     validate_cnp,
+    validate_grade,
     validate_name,
 )
 
@@ -373,7 +374,7 @@ def build_contract_pending_embed(row: dict, member: discord.abc.User, recruiter:
     embed.add_field(name="👤 Membru", value=f"{member.mention}\n`{member.id}`", inline=True)
     embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
     embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
-    embed.add_field(name="💼 Funcția", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(name="🎖️ Grad acordat", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
     embed.add_field(name="✍️ Angajator", value=f"{recruiter.mention}\n{row['recruiter_signature']}", inline=True)
     embed.add_field(name="🎖️ Grad angajator", value=row["recruiter_grade"], inline=True)
     embed.add_field(name="📌 Status", value="🟡 Așteaptă semnătura angajatului", inline=False)
@@ -393,7 +394,7 @@ def build_contract_signed_embed(row: dict) -> discord.Embed:
     )
     embed.add_field(name="🪪 Nume IC", value=row["nume_ic"], inline=True)
     embed.add_field(name="🔢 CNP", value=row["cnp"], inline=True)
-    embed.add_field(name="💼 Funcția", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
+    embed.add_field(name="🎖️ Grad acordat", value=row.get("functie") or DEFAULT_FUNCTION, inline=True)
     embed.add_field(name="✍️ Semnătura angajatului", value=row.get("member_signature") or "—", inline=True)
     embed.add_field(name="🎖️ Angajat de", value=f"{row['recruiter_signature']}\n{row['recruiter_grade']}", inline=True)
     signed_ts = unix_from_iso(row.get("signed_at"))
@@ -420,7 +421,7 @@ def build_termination_embed(contract: Optional[dict], resignation: dict, durata:
     if contract:
         embed.add_field(name="🪪 Nume IC", value=contract["nume_ic"], inline=True)
         embed.add_field(name="🔢 CNP", value=contract["cnp"], inline=True)
-        embed.add_field(name="💼 Funcția", value=contract.get("functie") or DEFAULT_FUNCTION, inline=True)
+        embed.add_field(name="🎖️ Grad deținut", value=contract.get("functie") or DEFAULT_FUNCTION, inline=True)
     elif resignation.get("request_name"):
         embed.add_field(name="🪪 Nume", value=resignation["request_name"][:256], inline=True)
 
@@ -877,13 +878,17 @@ class DemisieDecisionView(discord.ui.View):
         if not row:
             return
 
-        default_signature = row.get("request_name") or ""
+        default_signature = ""
         staff_contract = await db.get_last_contract(interaction.user.id)
         if staff_contract and staff_contract.get("member_signature"):
             default_signature = staff_contract["member_signature"]
 
         await interaction.response.send_modal(
-            AcceptDemisieModal(int(row["message_id"]), default_signature)
+            AcceptDemisieModal(
+                int(row["message_id"]),
+                default_signature,
+                top_role_name(interaction.user),
+            )
         )
 
     @discord.ui.button(
@@ -902,7 +907,7 @@ class DemisieDecisionView(discord.ui.View):
 
 
 class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
-    def __init__(self, message_id: int, default_signature: str):
+    def __init__(self, message_id: int, default_signature: str, default_grade: str):
         super().__init__(timeout=600)
         self.message_id = message_id
         self.semnatura = discord.ui.TextInput(
@@ -910,6 +915,14 @@ class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
             placeholder="Exemplu: Mihai Ionescu",
             default=default_signature[:60] if default_signature else None,
             min_length=3,
+            max_length=60,
+            required=True,
+        )
+        self.grad = discord.ui.TextInput(
+            label="Gradul tău",
+            placeholder="Exemplu: Director Medical",
+            default=default_grade[:60] if default_grade else None,
+            min_length=2,
             max_length=60,
             required=True,
         )
@@ -921,6 +934,7 @@ class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
             required=False,
         )
         self.add_item(self.semnatura)
+        self.add_item(self.grad)
         self.add_item(self.observatii)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -929,6 +943,7 @@ class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
             return
         try:
             signature = validate_name(str(self.semnatura.value))
+            grade = validate_grade(str(self.grad.value), "Gradul tău")
         except ValueError as exc:
             await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
             return
@@ -938,6 +953,7 @@ class AcceptDemisieModal(discord.ui.Modal, title="Acceptare demisie"):
             interaction,
             self.message_id,
             signature,
+            grade,
             clean_line(str(self.observatii.value or "")),
         )
 
@@ -1005,6 +1021,7 @@ async def finalize_termination(
     interaction: discord.Interaction,
     message_id: int,
     staff_signature: str,
+    staff_grade: str,
     observatii: str,
 ) -> None:
     row = await db.get_by_message_id(message_id)
@@ -1038,7 +1055,6 @@ async def finalize_termination(
         return
 
     contract = await db.get_active_contract(user_id) or await db.get_last_contract(user_id)
-    staff_grade = top_role_name(interaction.user)
     document_id = new_document_id("DEM")
 
     if observatii:
@@ -1296,7 +1312,8 @@ async def on_message(message: discord.Message) -> None:
     nume_ic="Numele și prenumele IC al membrului angajat.",
     cnp="CNP-ul IC al membrului angajat.",
     semnatura="Semnătura ta: numele și prenumele tău IC (angajatorul).",
-    functie="Funcția pe care este angajat (opțional).",
+    grad_angajator="Gradul tău, al celui care face contractul.",
+    grad_angajat="Gradul pe care îl primește membrul angajat.",
 )
 async def contract_command(
     interaction: discord.Interaction,
@@ -1304,7 +1321,8 @@ async def contract_command(
     nume_ic: str,
     cnp: str,
     semnatura: str,
-    functie: Optional[str] = None,
+    grad_angajator: str,
+    grad_angajat: str,
 ):
     if interaction.guild_id != MAIN_GUILD_ID:
         await interaction.response.send_message(
@@ -1334,15 +1352,10 @@ async def contract_command(
         nume_ic_clean = validate_name(nume_ic)
         semnatura_clean = validate_name(semnatura)
         cnp_clean = validate_cnp(cnp)
+        grad_angajator_clean = validate_grade(grad_angajator, "Gradul angajatorului")
+        grad_angajat_clean = validate_grade(grad_angajat, "Gradul angajatului")
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
-        return
-
-    functie_clean = clean_line(functie or "") or DEFAULT_FUNCTION
-    if len(functie_clean) > 60:
-        await interaction.response.send_message(
-            "❌ Funcția este prea lungă. Maxim 60 de caractere.", ephemeral=True
-        )
         return
 
     active = await db.get_active_contract(user.id)
@@ -1363,10 +1376,10 @@ async def contract_command(
         channel_id=interaction.channel_id,
         nume_ic=nume_ic_clean,
         cnp=cnp_clean,
-        functie=functie_clean,
+        functie=grad_angajat_clean,
         recruiter_id=interaction.user.id,
         recruiter_signature=semnatura_clean,
-        recruiter_grade=top_role_name(interaction.user),
+        recruiter_grade=grad_angajator_clean,
     )
 
     # Fără defer, ca mențiunea membrului să genereze o notificare reală.

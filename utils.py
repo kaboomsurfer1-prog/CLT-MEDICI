@@ -189,6 +189,7 @@ def clean_line(value: str) -> str:
 
 NAME_RE = re.compile(r"^[A-Za-zĂÂÎȘȚăâîșțŞşŢţ' .\-]{3,60}$")
 CNP_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z \-]{2,23}$")
+GRADE_RE = re.compile(r"^[A-Za-z0-9ĂÂÎȘȚăâîșțŞşŢţ .,'()\-/&]{2,60}$")
 
 
 def validate_name(value: str) -> str:
@@ -204,6 +205,16 @@ def validate_cnp(value: str) -> str:
     value = clean_line(value).upper()
     if not CNP_RE.match(value):
         raise ValueError("CNP-ul trebuie să aibă între 3 și 24 de caractere (cifre/litere).")
+    return value
+
+
+def validate_grade(value: str, field: str = "Gradul") -> str:
+    value = clean_line(value)
+    if not GRADE_RE.match(value):
+        raise ValueError(
+            f"{field} trebuie să aibă între 2 și 60 de caractere "
+            "(litere, cifre, spații și `- . , ' ( ) /`)."
+        )
     return value
 
 
