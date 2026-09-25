@@ -43,7 +43,7 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "da", "on"}
 
 
-BOT_VERSION = "2.1.0-legacy-ems-contracte"
+BOT_VERSION = "2.2.0-legacy-ems-medical"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
@@ -65,12 +65,16 @@ EMS_LOG_CHANNEL_ID = env_int("EMS_LOG_CHANNEL_ID", 0)
 MAIN_LOG_CHANNEL_ID = env_int("MAIN_LOG_CHANNEL_ID", 0)
 # Canalul folosit pentru generarea invitației în serverul EMS (opțional)
 EMS_INVITE_CHANNEL_ID = env_int("EMS_INVITE_CHANNEL_ID", 0)
+# Canalele (din oricare server) unde se pot folosi /radiografie și /analize
+MEDICAL_CHANNEL_IDS = env_ids("MEDICAL_CHANNEL_IDS", "1553137969899114646,1539978574864326737")
 
 # --- Roluri ---
 # Rolurile care pot emite contracte cu /contract
 RECRUITER_ROLE_IDS = env_ids("RECRUITER_ROLE_IDS", "1517181051288420372")
 # Rolurile care pot accepta / refuza demisii
 STAFF_ROLE_IDS = env_ids("STAFF_ROLE_IDS", "")
+# Rolurile care pot emite /radiografie și /analize. Gol = oricine scrie în canalele medicale.
+MEDICAL_ROLE_IDS = env_ids("MEDICAL_ROLE_IDS", "")
 
 # --- Diverse ---
 BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
@@ -118,6 +122,7 @@ OPTIONAL_IDS = {
     "EMS_LOG_CHANNEL_ID": EMS_LOG_CHANNEL_ID,
     "MAIN_LOG_CHANNEL_ID": MAIN_LOG_CHANNEL_ID,
     "EMS_INVITE_CHANNEL_ID": EMS_INVITE_CHANNEL_ID,
+    "MEDICAL_CHANNEL_IDS": MEDICAL_CHANNEL_IDS,
 }
 
 

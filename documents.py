@@ -1,11 +1,13 @@
 """Generarea documentelor oficiale (imagini PNG) pentru Legacy EMS.
 
-Sunt două documente:
+Sunt patru documente:
 
 * ``render_contract``     -> Contract Individual de Muncă (angajare)
 * ``render_termination``  -> Decizie de Încetare a Contractului (demisie acceptată)
+* ``render_radiography``  -> Buletin de Investigație Radiologică (cu filmul radiografiei)
+* ``render_lab_results``  -> Buletin de Analize Medicale
 
-Ambele folosesc același "hârtie oficială": ramă, antet cu cele două logo-uri,
+Toate folosesc aceeași "hârtie oficială": ramă, antet cu cele două logo-uri,
 corp de text în română, casete de semnătură și ștampilă rotundă.
 """
 
@@ -14,11 +16,15 @@ from __future__ import annotations
 import io
 import math
 import random
+import zlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+import medical
+import xray
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_DIR = BASE_DIR / "assets" / "fonts"
@@ -298,10 +304,13 @@ def _seal(
 
     layer = layer.resize((size, size), Image.LANCZOS)
     layer = layer.rotate(tilt, resample=Image.BICUBIC, expand=True)
+    return _ink(layer)
 
-    # Aspect de tuș: alpha neuniform.
+
+def _ink(layer: Image.Image, seed: int = 11) -> Image.Image:
+    """Aspect de tuș: alpha neuniform, ca la o ștampilă apăsată pe hârtie."""
     alpha = layer.getchannel("A")
-    rng = random.Random(11)
+    rng = random.Random(seed)
     grain = Image.new("L", (layer.width // 3 or 1, layer.height // 3 or 1))
     grain.putdata([rng.randint(150, 255) for _ in range(grain.width * grain.height)])
     grain = grain.resize(layer.size, Image.BILINEAR).filter(ImageFilter.GaussianBlur(1.2))
@@ -385,9 +394,17 @@ def _section_title(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, title:
     return y + 52
 
 
-def _fields_grid(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, fields: Sequence[tuple[str, str]]) -> int:
-    columns = 2
-    col_width = (width - 30) // columns
+def _fields_grid(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    width: int,
+    fields: Sequence[tuple],
+    columns: int = 2,
+) -> int:
+    """Câmpuri (etichetă, valoare[, culoare]) așezate pe ``columns`` coloane."""
+    gutter = 30
+    col_width = (width - gutter * (columns - 1)) // columns
     row_height = 62
     rows = math.ceil(len(fields) / columns)
 
@@ -396,14 +413,14 @@ def _fields_grid(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, fields: 
 
     label_font = _font("sans", 15)
     value_font_name = "serif_bold"
-    for index, (label, value) in enumerate(fields):
+    for index, (label, value, *color) in enumerate(fields):
         col = index % columns
         row = index // columns
-        fx = x + col * (col_width + 30)
+        fx = x + col * (col_width + gutter)
         fy = y + row * row_height
         draw.text((fx, fy), label.upper(), font=label_font, fill=MUTED)
         value_font = _shrink_to_fit(str(value), value_font_name, col_width, 23, 12)
-        draw.text((fx, fy + 22), _ellipsize(str(value), value_font, col_width), font=value_font, fill=INK)
+        draw.text((fx, fy + 22), _ellipsize(str(value), value_font, col_width), font=value_font, fill=color[0] if color else INK)
         draw.line((fx, fy + 52, fx + col_width, fy + 52), fill=(214, 208, 194), width=1)
     return panel_bottom + 26
 
@@ -430,6 +447,7 @@ def _signature_block(
     subtitle: str,
     signature: str,
     printed_name: str,
+    caption: str = "Semnătură",
 ) -> None:
     draw.rounded_rectangle((x, y, x + width, y + 210), radius=12, fill=(252, 250, 245), outline=LINE, width=1)
     draw.text((x + 20, y + 16), role.upper(), font=_font("sans_bold", 18), fill=BLUE)
@@ -442,7 +460,7 @@ def _signature_block(
     draw.line((x + 30, y + 152, x + width - 30, y + 152), fill=(120, 126, 138), width=2)
     name_font = _shrink_to_fit(printed_name, "sans", width - 40, 16, 10)
     draw.text((x + width / 2, y + 164), _ellipsize(printed_name, name_font, width - 40), font=name_font, fill=MUTED, anchor="ma")
-    draw.text((x + width / 2, y + 186), "Semnătură", font=_font("sans", 14), fill=(160, 160, 160), anchor="ma")
+    draw.text((x + width / 2, y + 186), caption, font=_font("sans", 14), fill=(160, 160, 160), anchor="ma")
 
 
 def _stamp(base: Image.Image, seal: Image.Image, content_end: int, signature_y: int) -> None:
@@ -800,5 +818,446 @@ def render_termination(
         document_id,
         data_incetarii,
         f"Document generat automat de sistemul {department} · Discord ID: {discord_id}",
+    )
+    return _to_png(base)
+
+
+# ----------------------------------------------------------------------
+# DOCUMENTE MEDICALE — ELEMENTE COMUNE
+# ----------------------------------------------------------------------
+
+PARAFA_INK = (28, 58, 150)
+
+
+def _parafa_code(medic: str) -> str:
+    """Codul de parafă al medicului: stabil pentru același nume."""
+    return f"E{zlib.crc32(medic.lower().encode('utf-8')) % 90000 + 10000}"
+
+
+def _parafa(lines: Sequence[str], tilt: float = -5.0) -> Image.Image:
+    """Parafa medicului: ștampilă dreptunghiulară cu nume, specialitate și cod."""
+    scale = 2
+    fonts = [
+        _shrink_to_fit(lines[0], "sans_bold", 176 * scale, 15 * scale, 8 * scale),
+        _font("sans", 12 * scale),
+        _font("sans_bold", 12 * scale),
+    ]
+    widths = [font.getlength(text) for font, text in zip(fonts, lines)]
+    width = int(max(widths) + 34 * scale)
+    height = int(sum(font.size * 1.35 for font in fonts) + 22 * scale)
+
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    ink = PARAFA_INK + (235,)
+    draw.rectangle((2, 2, width - 3, height - 3), outline=ink, width=3 * scale)
+    draw.rectangle((6 * scale, 6 * scale, width - 6 * scale - 1, height - 6 * scale - 1), outline=ink, width=scale)
+    y = 11 * scale
+    for font, text in zip(fonts, lines):
+        draw.text((width / 2, y), text, font=font, fill=ink, anchor="ma")
+        y += font.size * 1.35
+
+    layer = layer.resize((width // scale, height // scale), Image.LANCZOS)
+    layer = layer.rotate(tilt, resample=Image.BICUBIC, expand=True)
+    return _ink(layer, seed=29)
+
+
+def _badge(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, color, size: int = 17) -> int:
+    font = _font("sans_bold", size)
+    width = font.getlength(text) + 30
+    height = size + 18
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=height // 2, fill=color)
+    draw.text((x + width / 2, y + height / 2), text, font=font, fill=(255, 255, 255), anchor="mm")
+    return y + height
+
+
+def _label(draw: ImageDraw.ImageDraw, x: int, y: int, text: str) -> int:
+    draw.text((x, y), text.upper(), font=_font("sans_bold", 15), fill=BLUE)
+    return y + 25
+
+
+def _tint(color, amount: float = 0.1) -> tuple[int, int, int]:
+    return tuple(int(255 - (255 - channel) * amount) for channel in color)
+
+
+def _insurance_box(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, title: str, text: str, color) -> int:
+    """Caseta cu certificatul pentru asigurare, afișată la stare rea sau gravă."""
+    icon = 56
+    text_x = x + icon + 30
+    text_w = width - icon - 36
+    body = _font("serif", 17)
+    lines = _wrap(text, body, text_w)
+    height = max(icon + 30, 18 + 30 + len(lines) * 24 + 14)
+
+    draw.rounded_rectangle((x - 12, y, x + width + 12, y + height), radius=12, fill=_tint(color), outline=color, width=2)
+    cy = y + height / 2
+    draw.ellipse((x + 8, cy - icon / 2, x + 8 + icon, cy + icon / 2), fill=color)
+    draw.text((x + 8 + icon / 2, cy + 1), "⚕", font=_font("sans_bold", 34), fill=(255, 255, 255), anchor="mm")
+
+    ty = y + 18
+    draw.text((text_x, ty), title.upper(), font=_font("sans_bold", 18), fill=color)
+    ty += 30
+    for line in lines:
+        draw.text((text_x, ty), line, font=body, fill=INK)
+        ty += 24
+    return y + height
+
+
+def _medical_signatures(
+    base: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    margin: int,
+    medic: str,
+    specialty: str,
+    department: str,
+    department_subtitle: str,
+    city: str,
+    seal_lines: Sequence[str],
+) -> None:
+    """Rândul de jos: ștampila unității în stânga, semnătura și parafa medicului în dreapta."""
+    block_width = 470
+    right_x = WIDTH - margin - block_width
+    _signature_block(
+        base,
+        draw,
+        right_x,
+        y,
+        block_width,
+        "Medic",
+        f"{department} · {specialty}",
+        medic,
+        f"Dr. {medic}",
+        caption="Semnătura și parafa medicului",
+    )
+    parafa = _parafa([f"DR. {medic.upper()}", f"MEDIC · {specialty.upper()}", f"COD PARAFĂ {_parafa_code(medic)}"])
+    base.alpha_composite(parafa, (int(right_x + block_width - parafa.width - 8), int(y + 6)))
+
+    seal = _seal(214, f"{department.upper()} · {city.upper()}", department_subtitle.upper(), seal_lines, tilt=-7.0)
+    base.alpha_composite(seal, (int(margin + block_width / 2 - seal.width / 2), int(y + 105 - seal.height / 2)))
+
+
+def _signature_row_y(draw: ImageDraw.ImageDraw, content_end: int) -> int:
+    """Rândul de semnături stă jos, ca la contract; coboară doar dacă textul e lung."""
+    y = min(max(content_end + 58, HEIGHT - 380), HEIGHT - 352)
+    draw.text(
+        (WIDTH // 2, y - 36),
+        "Prezentul document este valabil numai cu semnătura și parafa medicului și ștampila unității.",
+        font=_font("serif_italic", 16),
+        fill=MUTED,
+        anchor="ma",
+    )
+    return y
+
+
+# ----------------------------------------------------------------------
+# DOCUMENT 3 — BULETIN RADIOLOGIC
+# ----------------------------------------------------------------------
+
+def render_radiography(
+    *,
+    document_id: str,
+    pacient: str,
+    cnp: str,
+    stare: str,
+    zona: str,
+    medic: str,
+    emis_la: str,
+    emis_de: str,
+    city: str = "Legacy of CLT",
+    department: str = "Legacy EMS",
+    department_subtitle: str = "Departamentul Medical",
+    logo_main: Optional[bytes] = None,
+    logo_ems: Optional[bytes] = None,
+) -> bytes:
+    stare_info = medical.STARI[stare]
+    zona_info = medical.ZONE[zona]
+    rezultat = medical.RADIOLOGIE[zona][stare]
+
+    base = _paper(WIDTH, HEIGHT, seed=23).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+    _frame(draw)
+
+    y = _header(
+        base,
+        draw,
+        _prepare_logo(logo_main, 150),
+        _prepare_logo(logo_ems, 150),
+        city,
+        department,
+        department_subtitle,
+        "Buletin de Investigație Radiologică",
+        f"Nr. {document_id} · emis la {emis_la}",
+    )
+
+    margin = 92
+    content_width = WIDTH - margin * 2
+
+    y = _section_title(draw, margin, y, content_width, "Datele pacientului")
+    y = _fields_grid(
+        draw,
+        margin,
+        y,
+        content_width,
+        [
+            ("Nume și prenume", pacient),
+            ("CNP", cnp),
+            ("Starea pacientului", stare_info.label, stare_info.color),
+            ("Zona investigată", f"{zona_info.label} · {zona_info.short}"),
+            ("Data și ora examinării", emis_la),
+            ("Medic examinator", f"Dr. {medic}"),
+        ],
+        columns=3,
+    )
+
+    # Filmul radiografiei, cu textele de pe margine ca pe un negatoscop digital.
+    overlay_font = _font("sans", 12)
+    film = xray.render_film(
+        zona,
+        stare,
+        {
+            "top_left": [f"{department.upper()} · RADIOLOGIE", _ellipsize(pacient.upper(), overlay_font, 230), f"CNP {cnp}"],
+            "top_right": [emis_la.replace("/", "."), f"{zona_info.label.upper()} · {zona_info.short}", _ellipsize(f"Dr. {medic}", overlay_font, 200)],
+            "bottom_left": [f"{zona_info.kv} kV · {medical.format_number(zona_info.mas, 1)} mAs", "DFF 100 cm"],
+            "bottom_right": [document_id, "Img 1/1"],
+        },
+        seed=zlib.crc32(document_id.encode("utf-8")),
+    )
+    film_x, film_y = margin, y
+    draw.rounded_rectangle((film_x - 8, film_y - 8, film_x + film.width + 8, film_y + film.height + 8), radius=10, fill=(20, 24, 32))
+    base.paste(film, (film_x, film_y))
+    draw.text(
+        (film_x + film.width / 2, film_y + film.height + 16),
+        f"Imagine radiologică digitală · {zona_info.projection}",
+        font=_font("sans", 14),
+        fill=MUTED,
+        anchor="ma",
+    )
+
+    # Coloana din dreapta: investigația, starea și rezultatul.
+    col_x = film_x + film.width + 34
+    col_w = WIDTH - margin - col_x
+    col_bottom = film_y + film.height
+    ty = film_y - 4
+    title_font = _shrink_to_fit(zona_info.examination, "serif_bold", col_w, 26, 18)
+    for line in _wrap(zona_info.examination, title_font, col_w):
+        draw.text((col_x, ty), line, font=title_font, fill=INK)
+        ty += title_font.size + 8
+    projection = zona_info.projection[0].upper() + zona_info.projection[1:]
+    draw.text((col_x, ty), projection, font=_font("sans", 16), fill=MUTED)
+    ty += 34
+    ty = _badge(draw, col_x, ty, f"STARE: {stare_info.label.upper()}", stare_info.color) + 22
+    draw.line((col_x, ty - 10, col_x + col_w, ty - 10), fill=LINE, width=1)
+
+    ty = _label(draw, col_x, ty + 4, "Descriere radiologică")
+    ty = _draw_paragraph_clamped(draw, col_x, ty, rezultat.descriere, "serif", INK, col_w, 190, start_size=18, min_size=14)
+    ty = _label(draw, col_x, ty + 14, "Concluzie")
+    ty = _draw_paragraph_clamped(draw, col_x, ty, rezultat.concluzie, "serif_bold", stare_info.color, col_w, 110, start_size=18, min_size=14)
+    tech = [
+        "Aparat: radiologie digitală directă (DR)",
+        f"Expunere: {zona_info.kv} kV · {medical.format_number(zona_info.mas, 1)} mAs · DFF 100 cm",
+        f"Arhivare PACS: {document_id}",
+    ]
+    tech_top = col_bottom - 25 - len(tech) * 22
+    ty = _label(draw, col_x, ty + 14, "Recomandări")
+    _draw_paragraph_clamped(draw, col_x, ty, rezultat.recomandari, "serif", INK, col_w, max(40, tech_top - 24 - ty), start_size=18, min_size=14)
+
+    draw.line((col_x, tech_top - 12, col_x + col_w, tech_top - 12), fill=LINE, width=1)
+    _label(draw, col_x, tech_top, "Date tehnice")
+    for index, line in enumerate(tech):
+        draw.text((col_x, tech_top + 25 + index * 22), line, font=_font("sans", 14), fill=MUTED)
+
+    y = film_y + film.height + 42
+    if medical.needs_insurance(stare):
+        y = _insurance_box(
+            draw,
+            margin,
+            y,
+            content_width,
+            medical.INSURANCE_TITLE,
+            medical.insurance_text(stare, department),
+            stare_info.color,
+        )
+
+    _medical_signatures(
+        base,
+        draw,
+        _signature_row_y(draw, y),
+        margin,
+        medic,
+        "Radiologie",
+        department,
+        department_subtitle,
+        city,
+        ["LEGACY", "EMS", "RADIOLOGIE"],
+    )
+    _footer(
+        draw,
+        document_id,
+        emis_la,
+        f"Document medical generat automat de sistemul {department} · Emis de {emis_de}",
+    )
+    return _to_png(base)
+
+
+# ----------------------------------------------------------------------
+# DOCUMENT 4 — BULETIN DE ANALIZE MEDICALE
+# ----------------------------------------------------------------------
+
+def _range_bar(draw: ImageDraw.ImageDraw, x: int, cy: float, width: int, result: medical.ValoareAnaliza) -> None:
+    """Bara de încadrare: zona verde este intervalul de referință, punctul este valoarea."""
+    test = result.test
+    span = (test.high - test.low) or 1.0
+    if result.value < test.low:
+        position = 0.25 - 0.23 * min(1.0, (test.low - result.value) / (span * 0.8))
+    elif result.value > test.high:
+        position = 0.75 + 0.23 * min(1.0, (result.value - test.high) / (span * 1.2))
+    else:
+        position = 0.25 + 0.5 * (result.value - test.low) / span
+
+    h = 8
+    draw.rounded_rectangle((x, cy - h / 2, x + width, cy + h / 2), radius=4, fill=(222, 216, 204))
+    draw.rounded_rectangle((x + width * 0.25, cy - h / 2, x + width * 0.75, cy + h / 2), radius=4, fill=(176, 216, 188))
+    color = (30, 132, 80) if result.flag == "normal" else RED
+    px = x + width * position
+    draw.ellipse((px - 7, cy - 7, px + 7, cy + 7), fill=color, outline=(255, 255, 255), width=2)
+
+
+def _lab_table(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, results: Sequence[medical.ValoareAnaliza]) -> int:
+    columns = [("Analiză", 330), ("Rezultat", 150), ("UM", 128), ("Interval de referință", 206), ("Încadrare", width - 814)]
+    header_h, group_h, row_h = 34, 25, 28
+
+    draw.rounded_rectangle((x - 12, y, x + width + 12, y + header_h), radius=8, fill=BLUE)
+    cx = x
+    for title, col_width in columns:
+        draw.text((cx, y + header_h / 2), title.upper(), font=_font("sans_bold", 13), fill=(255, 255, 255), anchor="lm")
+        cx += col_width
+    y += header_h + 4
+
+    group = None
+    for index, result in enumerate(results):
+        if result.test.group != group:
+            group = result.test.group
+            label_font = _font("sans_bold", 13)
+            mid = y + group_h / 2 + 2
+            draw.text((x, mid), group.upper(), font=label_font, fill=RED, anchor="lm")
+            line_x = x + label_font.getlength(group.upper()) + 14
+            draw.line((line_x, mid, x + width, mid), fill=LINE, width=1)
+            y += group_h
+
+        draw.rectangle((x - 12, y, x + width + 12, y + row_h), fill=(252, 250, 245) if index % 2 == 0 else (243, 239, 229))
+        mid = y + row_h / 2
+        cx = x
+        draw.text((cx, mid), result.test.name, font=_font("serif", 17), fill=INK, anchor="lm")
+        cx += columns[0][1]
+        abnormal = result.flag != "normal"
+        draw.text((cx, mid), f"{result.text} {result.arrow}".strip(), font=_font("sans_bold", 17), fill=RED if abnormal else INK, anchor="lm")
+        cx += columns[1][1]
+        draw.text((cx, mid), result.test.unit, font=_font("sans", 15), fill=MUTED, anchor="lm")
+        cx += columns[2][1]
+        draw.text((cx, mid), result.test.reference, font=_font("sans", 15), fill=MUTED, anchor="lm")
+        cx += columns[3][1]
+        _range_bar(draw, cx + 4, mid, columns[4][1] - 12, result)
+        y += row_h
+
+    draw.line((x - 12, y, x + width + 12, y), fill=LINE, width=1)
+    return y + 20
+
+
+def render_lab_results(
+    *,
+    document_id: str,
+    pacient: str,
+    cnp: str,
+    stare: str,
+    medic: str,
+    results: Sequence[medical.ValoareAnaliza],
+    emis_la: str,
+    emis_de: str,
+    city: str = "Legacy of CLT",
+    department: str = "Legacy EMS",
+    department_subtitle: str = "Departamentul Medical",
+    logo_main: Optional[bytes] = None,
+    logo_ems: Optional[bytes] = None,
+) -> bytes:
+    stare_info = medical.STARI[stare]
+    interpretare, concluzie = medical.INTERPRETARE[stare]
+
+    base = _paper(WIDTH, HEIGHT, seed=31).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+    _frame(draw)
+
+    y = _header(
+        base,
+        draw,
+        _prepare_logo(logo_main, 150),
+        _prepare_logo(logo_ems, 150),
+        city,
+        department,
+        department_subtitle,
+        "Buletin de Analize Medicale",
+        f"Nr. {document_id} · emis la {emis_la}",
+    )
+
+    margin = 92
+    content_width = WIDTH - margin * 2
+
+    y = _section_title(draw, margin, y, content_width, "Datele pacientului")
+    y = _fields_grid(
+        draw,
+        margin,
+        y,
+        content_width,
+        [
+            ("Nume și prenume", pacient),
+            ("CNP", cnp),
+            ("Starea pacientului", stare_info.label, stare_info.color),
+            ("Tip probă", "Sânge venos"),
+            ("Data și ora recoltării", emis_la),
+            ("Medic", f"Dr. {medic}"),
+        ],
+        columns=3,
+    )
+
+    y = _section_title(draw, margin, y, content_width, "Rezultatele analizelor")
+    y = _lab_table(draw, margin, y, content_width, results)
+
+    abnormal = sum(1 for result in results if result.flag != "normal")
+    summary = (
+        f"{abnormal} din {len(results)} parametri sunt în afara intervalului de referință."
+        if abnormal
+        else f"Toți cei {len(results)} parametri sunt în intervalul de referință."
+    )
+    y = _label(draw, margin, y, "Interpretare medicală")
+    y = _draw_paragraph_clamped(draw, margin, y, f"{summary} {interpretare}", "serif", INK, content_width, 104, start_size=18, min_size=14)
+    y = _draw_paragraph_clamped(draw, margin, y + 6, f"Concluzie: {concluzie}", "serif_bold", stare_info.color, content_width, 56, start_size=18, min_size=14)
+
+    if medical.needs_insurance(stare):
+        y = _insurance_box(
+            draw,
+            margin,
+            y + 14,
+            content_width,
+            medical.INSURANCE_TITLE,
+            medical.insurance_text(stare, department),
+            stare_info.color,
+        )
+
+    _medical_signatures(
+        base,
+        draw,
+        _signature_row_y(draw, y),
+        margin,
+        medic,
+        "Laborator",
+        department,
+        department_subtitle,
+        city,
+        ["LEGACY", "EMS", "LABORATOR"],
+    )
+    _footer(
+        draw,
+        document_id,
+        emis_la,
+        f"Document medical generat automat de sistemul {department} · Emis de {emis_de}",
     )
     return _to_png(base)

@@ -13,6 +13,11 @@ Flux demisie (serverul EMS):
     2. Conducerea acceptă sau refuză din butoane.
     3. La acceptare se generează Decizia de Încetare a Contractului, cu
        semnături, data intrării, data încetării și zilele lucrate.
+
+Documente medicale (doar în canalele din MEDICAL_CHANNEL_IDS, pe oricare server):
+    * `/radiografie` -> buletin radiologic cu imaginea radiografiei zonei alese
+    * `/analize`     -> buletin de analize medicale
+    La stare rea sau gravă, documentul menționează certificatul pentru asigurare.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import io
 import random
 import re
 import string
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -32,6 +38,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import documents
+import medical
 from config import (
     BOT_PREFIX,
     BOT_VERSION,
@@ -55,6 +62,8 @@ from config import (
     MAIN_GUILD_ID,
     MAIN_LOGO_URL,
     MAIN_LOG_CHANNEL_ID,
+    MEDICAL_CHANNEL_IDS,
+    MEDICAL_ROLE_IDS,
     RECRUITER_ROLE_IDS,
     STAFF_ROLE_IDS,
     log,
@@ -1272,6 +1281,120 @@ async def finalize_termination(
 
 
 # =========================
+# DOCUMENTE MEDICALE
+# =========================
+
+STARE_CHOICES = [app_commands.Choice(name=info.label, value=key) for key, info in medical.STARI.items()]
+ZONA_CHOICES = [app_commands.Choice(name=info.label, value=key) for key, info in medical.ZONE.items()]
+
+
+def in_medical_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
+    return any(channel_matches(channel, channel_id) for channel_id in MEDICAL_CHANNEL_IDS)
+
+
+def can_issue_medical(member: discord.abc.User) -> bool:
+    if not MEDICAL_ROLE_IDS:
+        return True
+    if has_any_role(member, MEDICAL_ROLE_IDS):
+        return True
+    return isinstance(member, discord.Member) and member.guild_permissions.administrator
+
+
+async def ensure_medical_access(interaction: discord.Interaction) -> bool:
+    """/radiografie și /analize merg doar în canalele medicale configurate."""
+    if not in_medical_channel(interaction.channel):
+        here = [
+            channel_id
+            for channel_id in sorted(MEDICAL_CHANNEL_IDS)
+            if getattr(getattr(bot.get_channel(channel_id), "guild", None), "id", None) == interaction.guild_id
+        ]
+        where = " sau ".join(f"<#{channel_id}>" for channel_id in here) or "canalele medicale Legacy EMS"
+        await interaction.response.send_message(f"❌ Folosește această comandă doar în {where}.", ephemeral=True)
+        return False
+    if not can_issue_medical(interaction.user):
+        await interaction.response.send_message("❌ Nu ai permisiune să emiți documente medicale.", ephemeral=True)
+        return False
+    return True
+
+
+def strip_doctor_title(value: str) -> str:
+    """„Dr. Ionescu” -> „Ionescu”: titlul se adaugă oricum pe document."""
+    return re.sub(r"^\s*(dr|doctor|doctorul|doctora)\.?\s+", "", value or "", flags=re.IGNORECASE)
+
+
+def validate_medical_input(nume_medic: str, nume_pacient: str, cnp_pacient: str) -> tuple[str, str, str]:
+    checks = (
+        ("Numele medicului", validate_name, strip_doctor_title(nume_medic)),
+        ("Numele pacientului", validate_name, nume_pacient),
+        ("CNP-ul pacientului", validate_cnp, cnp_pacient),
+    )
+    cleaned = []
+    for label, validator, value in checks:
+        try:
+            cleaned.append(validator(value))
+        except ValueError as exc:
+            raise ValueError(f"{label} nu este valid. {exc}") from None
+    return cleaned[0], cleaned[1], cleaned[2]
+
+
+def medical_embed(
+    *,
+    title: str,
+    stare: str,
+    pacient: str,
+    cnp: str,
+    medic: str,
+    issuer: discord.abc.User,
+    document_id: str,
+) -> discord.Embed:
+    info = medical.STARI[stare]
+    embed = discord.Embed(
+        title=title,
+        description=f"Document emis de {issuer.mention} în **{DEPARTMENT_NAME}** ({CITY_NAME}).",
+        color=info.discord_color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🧑 Pacient", value=pacient, inline=True)
+    embed.add_field(name="🔢 CNP", value=cnp, inline=True)
+    embed.add_field(name="🩺 Starea pacientului", value=f"{info.emoji} {info.label}", inline=True)
+    embed.add_field(name="👨‍⚕️ Medic", value=f"Dr. {medic}", inline=True)
+    embed.set_footer(text=f"ID document: {document_id} • {DEPARTMENT_NAME}")
+    return embed
+
+
+def add_insurance_field(embed: discord.Embed, stare: str) -> None:
+    if medical.needs_insurance(stare):
+        embed.add_field(name="📑 Certificat pentru asigurare", value=medical.INSURANCE_SHORT, inline=False)
+
+
+async def send_medical_document(
+    interaction: discord.Interaction,
+    render,
+    embed: discord.Embed,
+    filename: str,
+    **kwargs,
+) -> None:
+    """Generează imaginea în fundal și o postează în canal, împreună cu embed-ul."""
+    logo_main, logo_ems = await document_logos()
+    try:
+        png = await asyncio.to_thread(
+            render,
+            city=CITY_NAME,
+            department=DEPARTMENT_NAME,
+            department_subtitle=DEPARTMENT_SUBTITLE,
+            logo_main=logo_main,
+            logo_ems=logo_ems,
+            **kwargs,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Eroare la generarea documentului medical %s.", kwargs.get("document_id"))
+        await interaction.followup.send("❌ Nu am putut genera documentul. Încearcă din nou.", ephemeral=True)
+        return
+    embed.set_image(url=f"attachment://{filename}")
+    await interaction.followup.send(embed=embed, file=make_file(png, filename))
+
+
+# =========================
 # BOT
 # =========================
 
@@ -1287,20 +1410,44 @@ class LegacyEMSBot(commands.Bot):
         self.add_view(ContractDecisionView())
         self.add_view(DemisieDecisionView())
 
-        # Comenzile vechi (/setintrare, /intrare, /demisii) erau înregistrate pe
-        # serverul EMS și global. Le ștergem explicit.
+        # Comenzile vechi (/setintrare, /intrare, /demisii) erau înregistrate și
+        # global. Le ștergem explicit.
         self.tree.clear_commands(guild=None)
         await self.tree.sync()
 
-        ems_guild = discord.Object(id=EMS_GUILD_ID)
-        self.tree.clear_commands(guild=ems_guild)
-        await self.tree.sync(guild=ems_guild)
+        # /radiografie și /analize apar pe serverele unde sunt canalele medicale.
+        medical_guilds = await self.medical_guild_ids()
+        if medical_guilds:
+            for command in (radiografie_command, analize_command):
+                self.tree.add_command(command, guilds=[discord.Object(id=guild_id) for guild_id in medical_guilds])
 
-        synced = await self.tree.sync(guild=discord.Object(id=MAIN_GUILD_ID))
-        log.info(
-            "Comenzi sincronizate pe serverul principal: %s",
-            ", ".join(command.name for command in synced) or "niciuna",
-        )
+        # Sincronizarea înlocuiește tot ce era pe server, deci șterge și comenzile
+        # vechi de pe serverul EMS (unde acum rămân doar cele medicale, dacă e cazul).
+        for guild_id in sorted({MAIN_GUILD_ID, EMS_GUILD_ID, *medical_guilds}):
+            synced = await self.tree.sync(guild=discord.Object(id=guild_id))
+            log.info(
+                "Comenzi sincronizate pe serverul %s: %s",
+                guild_id,
+                ", ".join(command.name for command in synced) or "niciuna",
+            )
+
+    async def medical_guild_ids(self) -> set[int]:
+        """Serverele pe care se află canalele din MEDICAL_CHANNEL_IDS."""
+        guild_ids: set[int] = set()
+        for channel_id in MEDICAL_CHANNEL_IDS:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                log.warning("Nu am putut accesa canalul medical %s.", channel_id)
+                continue
+            guild = getattr(channel, "guild", None)
+            if guild is not None:
+                guild_ids.add(guild.id)
+                log.info("Canalul medical %s este pe serverul %s.", channel_id, guild.id)
+        if MEDICAL_CHANNEL_IDS and not guild_ids:
+            log.warning("Niciun canal medical nu e accesibil; înregistrez comenzile pe ambele servere.")
+            guild_ids = {MAIN_GUILD_ID, EMS_GUILD_ID}
+        return guild_ids
 
 
 bot = LegacyEMSBot(command_prefix=BOT_PREFIX, intents=intents)
@@ -1514,6 +1661,144 @@ async def contract_command(
 async def contract_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     log.exception("Eroare în /contract: %s", error)
     payload = "❌ A apărut o eroare la emiterea contractului. Încearcă din nou."
+    if interaction.response.is_done():
+        await interaction.followup.send(payload, ephemeral=True)
+    else:
+        await interaction.response.send_message(payload, ephemeral=True)
+
+
+# Comenzile medicale nu sunt legate de un server aici: setup_hook le adaugă pe
+# serverele unde se află canalele din MEDICAL_CHANNEL_IDS.
+@app_commands.command(
+    name="radiografie",
+    description="Emite o radiografie cu buletin radiologic Legacy EMS.",
+)
+@app_commands.describe(
+    nume_medic="Numele medicului care semnează documentul (Nume Prenume).",
+    nume_pacient="Numele și prenumele pacientului.",
+    cnp_pacient="CNP-ul pacientului.",
+    stare="Starea pacientului: Bună, Normală, Rea sau Gravă.",
+    zona="Zona radiografiată: Mână, Picior, Cap, Gât sau Genunchi.",
+)
+@app_commands.choices(stare=STARE_CHOICES, zona=ZONA_CHOICES)
+async def radiografie_command(
+    interaction: discord.Interaction,
+    nume_medic: str,
+    nume_pacient: str,
+    cnp_pacient: str,
+    stare: app_commands.Choice[str],
+    zona: app_commands.Choice[str],
+):
+    if not await ensure_medical_access(interaction):
+        return
+    try:
+        medic, pacient, cnp = validate_medical_input(nume_medic, nume_pacient, cnp_pacient)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    document_id = new_document_id("RAD")
+    zona_info = medical.ZONE[zona.value]
+    embed = medical_embed(
+        title=f"🩻 {zona_info.examination}",
+        stare=stare.value,
+        pacient=pacient,
+        cnp=cnp,
+        medic=medic,
+        issuer=interaction.user,
+        document_id=document_id,
+    )
+    embed.add_field(name="📍 Zona investigată", value=f"{zona_info.label} · {zona_info.projection}", inline=False)
+    embed.add_field(name="📋 Concluzie", value=medical.RADIOLOGIE[zona.value][stare.value].concluzie, inline=False)
+    add_insurance_field(embed, stare.value)
+
+    await send_medical_document(
+        interaction,
+        documents.render_radiography,
+        embed,
+        "radiografie.png",
+        document_id=document_id,
+        pacient=pacient,
+        cnp=cnp,
+        stare=stare.value,
+        zona=zona.value,
+        medic=medic,
+        emis_la=format_dt(now_local().isoformat()),
+        emis_de=display_tag(interaction.user),
+    )
+
+
+@app_commands.command(
+    name="analize",
+    description="Emite un buletin de analize medicale Legacy EMS.",
+)
+@app_commands.describe(
+    nume_medic="Numele medicului care semnează documentul (Nume Prenume).",
+    nume_pacient="Numele și prenumele pacientului.",
+    cnp_pacient="CNP-ul pacientului.",
+    stare="Starea pacientului: Bună, Normală, Rea sau Gravă.",
+)
+@app_commands.choices(stare=STARE_CHOICES)
+async def analize_command(
+    interaction: discord.Interaction,
+    nume_medic: str,
+    nume_pacient: str,
+    cnp_pacient: str,
+    stare: app_commands.Choice[str],
+):
+    if not await ensure_medical_access(interaction):
+        return
+    try:
+        medic, pacient, cnp = validate_medical_input(nume_medic, nume_pacient, cnp_pacient)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    document_id = new_document_id("ANL")
+    results = medical.generate_lab_results(stare.value, zlib.crc32(document_id.encode("utf-8")))
+    embed = medical_embed(
+        title="🧪 Buletin de analize medicale",
+        stare=stare.value,
+        pacient=pacient,
+        cnp=cnp,
+        medic=medic,
+        issuer=interaction.user,
+        document_id=document_id,
+    )
+    abnormal = [result for result in results if result.flag != "normal"]
+    embed.add_field(
+        name=f"⚠️ Valori modificate ({len(abnormal)} din {len(results)})",
+        value="\n".join(
+            f"{result.arrow} **{result.test.name}**: {result.text} {result.test.unit}" for result in abnormal
+        ) or "Toate valorile sunt în intervalul de referință.",
+        inline=False,
+    )
+    embed.add_field(name="📋 Concluzie", value=medical.INTERPRETARE[stare.value][1], inline=False)
+    add_insurance_field(embed, stare.value)
+
+    await send_medical_document(
+        interaction,
+        documents.render_lab_results,
+        embed,
+        "analize.png",
+        document_id=document_id,
+        pacient=pacient,
+        cnp=cnp,
+        stare=stare.value,
+        medic=medic,
+        results=results,
+        emis_la=format_dt(now_local().isoformat()),
+        emis_de=display_tag(interaction.user),
+    )
+
+
+@radiografie_command.error
+@analize_command.error
+async def medical_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    log.exception("Eroare în /%s: %s", interaction.command.name if interaction.command else "?", error)
+    payload = "❌ A apărut o eroare la emiterea documentului medical. Încearcă din nou."
     if interaction.response.is_done():
         await interaction.followup.send(payload, ephemeral=True)
     else:

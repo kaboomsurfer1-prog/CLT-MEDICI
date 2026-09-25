@@ -1,4 +1,4 @@
-# Legacy EMS Bot — Contracte & Demisii
+# Legacy EMS Bot — Contracte, Demisii & Documente Medicale
 
 Bot Discord pentru **Departamentul Medical Legacy EMS** din orașul **Legacy of CLT**.
 Rulează pe două servere în același timp:
@@ -8,7 +8,7 @@ Rulează pe două servere în același timp:
 | Legacy of CLT (principal) | `1505903653079351357` | angajări, contracte |
 | Legacy EMS (medici) | `1518542545569976492` | arhivă contracte, demisii |
 
-Versiune: `2.1.0-legacy-ems-contracte`
+Versiune: `2.2.0-legacy-ems-medical`
 
 ---
 
@@ -104,19 +104,72 @@ Nu mai există `/setintrare`. Data intrării este determinată automat, în ordi
 
 ---
 
-## 3. Comenzi
+## 3. Documente medicale: `/radiografie` și `/analize`
+
+Cele două comenzi merg **doar** în canalele medicale:
+
+- `1553137969899114646`
+- `1539978574864326737`
+
+Botul află singur pe ce server este fiecare canal și înregistrează comenzile
+acolo. Folosite în alt canal, răspund cu un mesaj privat de refuz.
+
+### `/radiografie`
+
+```text
+/radiografie nume_medic:Mihai Ionescu nume_pacient:Andrei Popescu
+             cnp_pacient:1980512345678 stare:Gravă zona:Picior
+```
+
+| Câmp | Ce se scrie |
+| --- | --- |
+| `nume_medic` | numele medicului; apare ca semnătură și pe parafă |
+| `nume_pacient` | numele și prenumele pacientului |
+| `cnp_pacient` | CNP-ul pacientului |
+| `stare` | `Bună`, `Normală`, `Rea` sau `Gravă` |
+| `zona` | `Mână`, `Picior`, `Cap`, `Gât` sau `Genunchi` |
+
+Botul generează **Buletinul de Investigație Radiologică** (imagine A4, în română):
+
+- antetul Legacy of CLT / Legacy EMS cu ambele logo-uri
+- **filmul radiografiei** zonei alese, cu datele pacientului pe margine
+- leziunea desenată după stare: fără leziuni (`Bună`), tumefiere ușoară
+  (`Normală`), fisură (`Rea`) sau fractură cu deplasare și eschile (`Gravă`),
+  marcată cu un cerc roșu
+- descrierea radiologică, concluzia și recomandările, în română
+- semnătura și **parafa medicului**, plus ștampila unității
+
+### `/analize`
+
+Aceleași câmpuri, fără `zona`. Botul generează **Buletinul de Analize
+Medicale**: hemogramă, biochimie și markeri inflamatori, cu valorile, intervalele
+de referință și o bară de încadrare. Valorile urmează starea: toate normale la
+`Bună`/`Normală`, 6 din 11 modificate la `Rea`, toate modificate la `Gravă`.
+
+### Certificatul pentru asigurare
+
+La stare **`Rea`** sau **`Gravă`**, ambele documente (și mesajul din Discord)
+au o casetă care spune că spitalul oferă un certificat medical pentru
+asigurarea pacientului, în caz de accident sau dacă pacientul a fost vătămat de
+o altă persoană, cu obligația de despăgubire pentru îngrijirile medicale.
+
+---
+
+## 4. Comenzi
 
 | Comandă | Unde | Cine |
 | --- | --- | --- |
 | `/contract` | canalul de contracte, serverul principal | rolurile din `RECRUITER_ROLE_IDS` + administratori |
+| `/radiografie` | canalele din `MEDICAL_CHANNEL_IDS` | oricine scrie acolo (sau doar `MEDICAL_ROLE_IDS`, dacă e setat) |
+| `/analize` | canalele din `MEDICAL_CHANNEL_IDS` | oricine scrie acolo (sau doar `MEDICAL_ROLE_IDS`, dacă e setat) |
 
-`/contract` este **singura** comandă. Tot restul se face din butoane.
+Contractele și demisiile se fac în rest din butoane.
 Comenzile vechi (`/setintrare`, `/intrare`, `/demisii`, `/semneaza`) au fost
 **șterse** și sunt eliminate automat de pe Discord la pornire.
 
 ---
 
-## 4. Variabile Railway
+## 5. Variabile Railway
 
 Obligatorii:
 
@@ -136,6 +189,13 @@ DEMISIE_CHANNEL_ID=ID_CANAL_DEMISII
 EMS_LOG_CHANNEL_ID=ID_CANAL_LOG_EMS
 MAIN_LOG_CHANNEL_ID=ID_CANAL_LOG_MAIN
 STAFF_ROLE_IDS=ID_ROL_1,ID_ROL_2
+```
+
+Pentru documentele medicale (implicit sunt deja cele două canale de mai sus):
+
+```env
+MEDICAL_CHANNEL_IDS=1553137969899114646,1539978574864326737
+MEDICAL_ROLE_IDS=
 ```
 
 Opționale:
@@ -160,7 +220,7 @@ demisie este dezactivat (apare un avertisment în loguri).
 
 ---
 
-## 5. Permisiuni Discord necesare
+## 6. Permisiuni Discord necesare
 
 **Developer Portal — Intents:**
 
@@ -174,7 +234,7 @@ demisie este dezactivat (apare un avertisment în loguri).
 
 ---
 
-## 6. Logo-uri pe documente
+## 7. Logo-uri pe documente
 
 Vezi [`assets/logos/README.md`](assets/logos/README.md).
 Ordinea: fișier local → `MAIN_LOGO_URL` / `EMS_LOGO_URL` → iconița serverului Discord.
@@ -184,7 +244,7 @@ local și pe Railway.
 
 ---
 
-## 7. Storage Railway
+## 8. Storage Railway
 
 Serviciul `CLT-MEDICI` are deja un Railway Volume (`clt-medici-volume`) montat pe:
 
@@ -198,13 +258,15 @@ pierde la restart.
 
 ---
 
-## 8. Structura proiectului
+## 9. Structura proiectului
 
 ```text
 main.py        comenzi, butoane, ferestre, fluxuri
 config.py      variabile de mediu si validare la pornire
 database.py    SQLite: contracte, demisii, date de intrare
-documents.py   generarea imaginilor (contract + decizie de incetare)
+documents.py   generarea imaginilor (contract, decizie de incetare, radiografie, analize)
+medical.py     texte medicale, stari, zone si valorile analizelor
+xray.py        filmul radiografiei, desenat procedural pentru fiecare zona
 utils.py       date, durate, validari, formatari
 assets/fonts   fonturile documentelor (DejaVu + Great Vibes)
 assets/logos   logo-urile folosite pe documente
