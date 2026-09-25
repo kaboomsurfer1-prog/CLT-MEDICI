@@ -43,7 +43,7 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "da", "on"}
 
 
-BOT_VERSION = "2.2.0-legacy-ems-medical"
+BOT_VERSION = "2.3.0-legacy-ems-concediere"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 

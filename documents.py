@@ -1,11 +1,12 @@
 """Generarea documentelor oficiale (imagini PNG) pentru Legacy EMS.
 
-Sunt patru documente:
+Sunt cinci documente:
 
 * ``render_contract``     -> Contract Individual de Muncă (angajare)
 * ``render_termination``  -> Decizie de Încetare a Contractului (demisie acceptată)
 * ``render_radiography``  -> Buletin de Investigație Radiologică (cu filmul radiografiei)
 * ``render_lab_results``  -> Buletin de Analize Medicale
+* ``render_dismissal``    -> Decizie de Concediere (/concediaza)
 
 Toate folosesc aceeași "hârtie oficială": ramă, antet cu cele două logo-uri,
 corp de text în română, casete de semnătură și ștampilă rotundă.
@@ -902,6 +903,28 @@ def _insurance_box(draw: ImageDraw.ImageDraw, x: int, y: int, width: int, title:
     return y + height
 
 
+def _seal_and_signature(
+    base: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    y: int,
+    margin: int,
+    seal: Image.Image,
+    role: str,
+    subtitle: str,
+    signature: str,
+    printed_name: str,
+    caption: str,
+    parafa: Optional[Image.Image] = None,
+) -> None:
+    """Rândul de jos al unui act emis de unitate: ștampila în stânga, o singură semnătură în dreapta."""
+    block_width = 470
+    right_x = WIDTH - margin - block_width
+    _signature_block(base, draw, right_x, y, block_width, role, subtitle, signature, printed_name, caption=caption)
+    if parafa is not None:
+        base.alpha_composite(parafa, (int(right_x + block_width - parafa.width - 8), int(y + 6)))
+    base.alpha_composite(seal, (int(margin + block_width / 2 - seal.width / 2), int(y + 105 - seal.height / 2)))
+
+
 def _medical_signatures(
     base: Image.Image,
     draw: ImageDraw.ImageDraw,
@@ -914,26 +937,20 @@ def _medical_signatures(
     city: str,
     seal_lines: Sequence[str],
 ) -> None:
-    """Rândul de jos: ștampila unității în stânga, semnătura și parafa medicului în dreapta."""
-    block_width = 470
-    right_x = WIDTH - margin - block_width
-    _signature_block(
+    """Ștampila unității, semnătura medicului și parafa lui."""
+    _seal_and_signature(
         base,
         draw,
-        right_x,
         y,
-        block_width,
+        margin,
+        _seal(214, f"{department.upper()} · {city.upper()}", department_subtitle.upper(), seal_lines, tilt=-7.0),
         "Medic",
         f"{department} · {specialty}",
         medic,
         f"Dr. {medic}",
-        caption="Semnătura și parafa medicului",
+        "Semnătura și parafa medicului",
+        parafa=_parafa([f"DR. {medic.upper()}", f"MEDIC · {specialty.upper()}", f"COD PARAFĂ {_parafa_code(medic)}"]),
     )
-    parafa = _parafa([f"DR. {medic.upper()}", f"MEDIC · {specialty.upper()}", f"COD PARAFĂ {_parafa_code(medic)}"])
-    base.alpha_composite(parafa, (int(right_x + block_width - parafa.width - 8), int(y + 6)))
-
-    seal = _seal(214, f"{department.upper()} · {city.upper()}", department_subtitle.upper(), seal_lines, tilt=-7.0)
-    base.alpha_composite(seal, (int(margin + block_width / 2 - seal.width / 2), int(y + 105 - seal.height / 2)))
 
 
 def _signature_row_y(draw: ImageDraw.ImageDraw, content_end: int) -> int:
@@ -1259,5 +1276,132 @@ def render_lab_results(
         document_id,
         emis_la,
         f"Document medical generat automat de sistemul {department} · Emis de {emis_de}",
+    )
+    return _to_png(base)
+
+
+# ----------------------------------------------------------------------
+# DOCUMENT 5 — DECIZIE DE CONCEDIERE
+# ----------------------------------------------------------------------
+
+def render_dismissal(
+    *,
+    document_id: str,
+    contract_id: Optional[str],
+    nume_ic: str,
+    cnp: str,
+    functie: str,
+    discord_tag: str,
+    discord_id: str,
+    data_angajarii: str,
+    data_concedierii: str,
+    durata: str,
+    zile: str,
+    motiv: str,
+    semnatura_conducere: str,
+    grad_conducere: str,
+    conducere_discord: str,
+    city: str = "Legacy of CLT",
+    department: str = "Legacy EMS",
+    department_subtitle: str = "Departamentul Medical",
+    logo_main: Optional[bytes] = None,
+    logo_ems: Optional[bytes] = None,
+) -> bytes:
+    base = _paper(WIDTH, HEIGHT, seed=41).convert("RGBA")
+    draw = ImageDraw.Draw(base)
+    _frame(draw)
+
+    y = _header(
+        base,
+        draw,
+        _prepare_logo(logo_main, 150),
+        _prepare_logo(logo_ems, 150),
+        city,
+        department,
+        department_subtitle,
+        "Decizie de Concediere",
+        f"Nr. {document_id} · emisă la {data_concedierii}",
+    )
+
+    margin = 92
+    content_width = WIDTH - margin * 2
+
+    ended = f"contractului individual de muncă nr. {contract_id}" if contract_id else "raporturilor de muncă cu departamentul"
+    cnp_text = f" (CNP {cnp})" if cnp and cnp != "—" else ""
+    intro = (
+        f"Conducerea Departamentului Medical {department} al orașului {city}, reprezentată prin "
+        f"{semnatura_conducere}, în calitate de {grad_conducere}, dispune concedierea numitului/numitei "
+        f"{nume_ic}{cnp_text} și încetarea {ended}, începând cu data de {data_concedierii}."
+    )
+    y = _draw_paragraph_clamped(draw, margin, y, intro, "serif", INK, content_width, 150)
+    y += 16
+
+    banner_h = 60
+    draw.rounded_rectangle((margin - 12, y, WIDTH - margin + 12, y + banner_h), radius=10, fill=(250, 236, 234), outline=RED, width=2)
+    banner_text = f"{nume_ic} nu mai face parte din {department} · concediere"
+    banner_font = _shrink_to_fit(banner_text, "sans_bold", content_width - 20, 22, 13)
+    draw.text((WIDTH // 2, y + banner_h / 2), banner_text, font=banner_font, fill=RED, anchor="mm")
+    y += banner_h + 30
+
+    y = _section_title(draw, margin, y, content_width, "Situația activității")
+    y = _fields_grid(
+        draw,
+        margin,
+        y,
+        content_width,
+        [
+            ("Nume și prenume", nume_ic),
+            ("CNP", cnp),
+            ("Gradul deținut", functie),
+            ("Cont Discord", discord_tag),
+            ("Data intrării în departament", data_angajarii),
+            ("Data concedierii", data_concedierii),
+            ("Perioadă lucrată", durata),
+            ("Total zile în departament", zile),
+        ],
+    )
+
+    y = _section_title(draw, margin, y, content_width, "Motivul concedierii")
+    y = _draw_paragraph_clamped(draw, margin, y, motiv, "serif_italic", INK, content_width, 150, start_size=19)
+    y += 18
+
+    _clauses(
+        draw,
+        margin,
+        y,
+        content_width,
+        [
+            f"Începând cu data de {data_concedierii}, persoana menționată nu mai deține nicio funcție și niciun drept "
+            f"în cadrul {department}.",
+            "Toate rolurile, accesele, echipamentul și dotările departamentului se retrag în mod obligatoriu.",
+            "Prezenta decizie intră în vigoare la data emiterii, se comunică persoanei concediate și se arhivează "
+            "la dosarul acesteia.",
+        ],
+    )
+
+    _seal_and_signature(
+        base,
+        draw,
+        HEIGHT - 380,
+        margin,
+        _seal(
+            214,
+            f"{department.upper()} · {city.upper()}",
+            department_subtitle.upper(),
+            ["LEGACY", "EMS", "CONDUCERE"],
+            color=(150, 34, 34),
+            tilt=7.0,
+        ),
+        "Conducerea departamentului",
+        f"{grad_conducere} · {conducere_discord}",
+        semnatura_conducere,
+        semnatura_conducere,
+        "Semnătură și ștampilă",
+    )
+    _footer(
+        draw,
+        document_id,
+        data_concedierii,
+        f"Document generat automat de sistemul {department} · Discord ID: {discord_id}",
     )
     return _to_png(base)

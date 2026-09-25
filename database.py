@@ -284,14 +284,15 @@ class Database:
         terminated_at_iso: str,
         worked_seconds: Optional[int],
     ) -> Optional[dict]:
+        """Încheie un contract activ. Întoarce None dacă nu mai era activ."""
         async with self.lock:
             with self.conn:
-                self.conn.execute(
+                cursor = self.conn.execute(
                     """
                     UPDATE contracts
                     SET status = 'TERMINATED', terminated_by = ?, terminated_signature = ?,
                         terminated_grade = ?, terminated_reason = ?, terminated_at = ?, worked_seconds = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'SIGNED'
                     """,
                     (
                         str(terminated_by),
@@ -303,6 +304,8 @@ class Database:
                         contract_id,
                     ),
                 )
+                if cursor.rowcount == 0:
+                    return None
                 row = self.conn.execute("SELECT * FROM contracts WHERE id = ?", (contract_id,)).fetchone()
                 return dict(row) if row else None
 

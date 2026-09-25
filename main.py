@@ -14,6 +14,12 @@ Flux demisie (serverul EMS):
     3. La acceptare se generează Decizia de Încetare a Contractului, cu
        semnături, data intrării, data încetării și zilele lucrate.
 
+Flux concediere (serverul principal, canalul de contracte):
+    1. Un membru cu rol de recrutare folosește `/concediaza` cu motivul,
+       semnătura și gradul lui, apoi confirmă dintr-un mesaj privat.
+    2. Contractul activ se încheie, iar Decizia de Concediere (imagine) se
+       postează în canalul de contracte, în arhiva EMS și se trimite prin DM.
+
 Documente medicale (doar în canalele din MEDICAL_CHANNEL_IDS, pe oricare server):
     * `/radiografie` -> buletin radiologic cu imaginea radiografiei zonei alese
     * `/analize`     -> buletin de analize medicale
@@ -86,6 +92,7 @@ from utils import (
     validate_cnp,
     validate_grade,
     validate_name,
+    validate_reason,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -554,6 +561,8 @@ def build_decision_embed(row: dict) -> discord.Embed:
         title, color, status_line = "✅ Demisie Acceptată", discord.Color.green(), "🟢 Acceptată"
     elif status == "REFUSED":
         title, color, status_line = "❌ Demisie Refuzată", discord.Color.red(), "🔴 Refuzată"
+    elif status == "CLOSED":
+        title, color, status_line = "⚪ Cerere de demisie închisă", discord.Color.light_grey(), "⚪ Închisă — membrul a fost concediat"
     else:
         title, color, status_line = "📋 Cerere de Demisie", discord.Color.orange(), "🟡 În așteptare"
 
@@ -1281,6 +1290,337 @@ async def finalize_termination(
 
 
 # =========================
+# CONCEDIERE
+# =========================
+
+async def build_dismissal_png(
+    *,
+    document_id: str,
+    contract: Optional[dict],
+    member: discord.abc.User,
+    nume_ic: str,
+    cnp: str,
+    functie: str,
+    staff: discord.abc.User,
+    staff_signature: str,
+    staff_grade: str,
+    motiv: str,
+    join_date_iso: Optional[str],
+    end_iso: str,
+    worked_seconds: Optional[int],
+) -> bytes:
+    logo_main, logo_ems = await document_logos()
+    return await asyncio.to_thread(
+        documents.render_dismissal,
+        document_id=document_id,
+        contract_id=(contract or {}).get("id"),
+        nume_ic=nume_ic,
+        cnp=cnp,
+        functie=functie,
+        discord_tag=display_tag(member),
+        discord_id=str(member.id),
+        data_angajarii=format_date_ro(join_date_iso) if join_date_iso else "—",
+        data_concedierii=format_date_ro(end_iso),
+        durata=format_duration_seconds(worked_seconds),
+        zile=format_days(worked_seconds // 86400 if worked_seconds is not None else None),
+        motiv=motiv,
+        semnatura_conducere=staff_signature,
+        grad_conducere=staff_grade,
+        conducere_discord=display_tag(staff),
+        city=CITY_NAME,
+        department=DEPARTMENT_NAME,
+        department_subtitle=DEPARTMENT_SUBTITLE,
+        logo_main=logo_main,
+        logo_ems=logo_ems,
+    )
+
+
+def build_dismissal_preview(
+    member: discord.abc.User,
+    contract: Optional[dict],
+    nume_ic: str,
+    motiv: str,
+    signature: str,
+    grade: str,
+) -> discord.Embed:
+    """Mesajul privat în care cel care concediază confirmă sau anulează."""
+    embed = discord.Embed(
+        title="⚠️ Confirmă concedierea",
+        description=(
+            f"Confirmi concedierea lui {member.mention} din **{DEPARTMENT_NAME}**?\n"
+            "Contractul se încheie imediat, iar decizia se postează și se trimite membrului prin DM."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(name="🪪 Nume IC", value=nume_ic, inline=True)
+    if contract:
+        contract_text = f"`{contract['id']}` · semnat {format_dt(contract.get('signed_at'))}"
+    else:
+        contract_text = "⚠️ Nu are contract activ în sistem — decizia se emite fără număr de contract."
+    embed.add_field(name="📄 Contract", value=contract_text, inline=False)
+    embed.add_field(name="✍️ Semnătura ta", value=f"{signature} · {grade}", inline=False)
+    embed.add_field(name="📝 Motiv", value=motiv[:1024], inline=False)
+    embed.set_footer(text="Butoanele expiră în 3 minute.")
+    return embed
+
+
+def build_dismissal_embed(
+    *,
+    user_id: int,
+    document_id: str,
+    contract: Optional[dict],
+    nume_ic: str,
+    cnp: str,
+    functie: str,
+    join_date_iso: Optional[str],
+    end_iso: str,
+    worked_seconds: Optional[int],
+    motiv: str,
+    staff: discord.abc.User,
+    staff_signature: str,
+    staff_grade: str,
+    with_image: bool,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="📕 Decizie de concediere",
+        description=(
+            f"{user_mention(user_id)} nu mai face parte din **{DEPARTMENT_NAME}** "
+            f"({DEPARTMENT_SUBTITLE}) — concediere."
+        ),
+        color=discord.Color.dark_red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="🪪 Nume IC", value=nume_ic, inline=True)
+    embed.add_field(name="🔢 CNP", value=cnp, inline=True)
+    embed.add_field(name="🎖️ Grad deținut", value=functie, inline=True)
+    embed.add_field(name="📅 Data intrării", value=format_dt(join_date_iso), inline=True)
+    embed.add_field(name="📅 Data concedierii", value=format_dt(end_iso), inline=True)
+    embed.add_field(name="⏳ Perioadă lucrată", value=format_duration_seconds(worked_seconds), inline=True)
+    embed.add_field(name="📄 Contract", value=f"`{contract['id']}`" if contract else "fără contract activ", inline=True)
+    embed.add_field(name="👮 Decizie emisă de", value=f"{staff.mention}\n{staff_signature} · {staff_grade}", inline=True)
+    embed.add_field(
+        name="🗓️ Total zile",
+        value=format_days(worked_seconds // 86400 if worked_seconds is not None else None),
+        inline=True,
+    )
+    embed.add_field(name="📝 Motivul concedierii", value=motiv[:1024], inline=False)
+    embed.add_field(name="⚠️ Roluri", value="Rolurile se elimină manual de către conducere.", inline=False)
+    if with_image:
+        embed.set_image(url="attachment://concediere.png")
+    embed.set_footer(text=f"ID decizie: {document_id} • {DEPARTMENT_NAME}")
+    return embed
+
+
+async def close_pending_resignation(user_id: int, staff_id: int, join_date_iso: Optional[str], days: Optional[int]) -> None:
+    """O cerere de demisie rămasă în așteptare se închide: membrul a fost deja concediat."""
+    pending = await db.get_pending_for_user(user_id)
+    if not pending:
+        return
+    closed = await db.decide(
+        int(pending["message_id"]),
+        status="CLOSED",
+        decided_by=staff_id,
+        reason="Cererea s-a închis: membrul a fost concediat.",
+        join_date_iso=join_date_iso,
+        days=days,
+    )
+    if not closed or closed["status"] != "CLOSED":
+        return
+    try:
+        channel = bot.get_channel(int(closed["channel_id"])) or await bot.fetch_channel(int(closed["channel_id"]))
+        message = await channel.fetch_message(int(closed["message_id"]))
+        await message.edit(embed=build_decision_embed(closed), view=DemisieDecisionView.disabled())
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.exception("Nu am putut închide cererea de demisie %s.", closed["id"])
+
+
+async def finalize_dismissal(
+    interaction: discord.Interaction,
+    member: discord.abc.User,
+    motiv: str,
+    signature: str,
+    grade: str,
+    nume_ic_override: Optional[str],
+    cnp_override: Optional[str],
+    expected_contract_id: Optional[str],
+) -> None:
+    staff = interaction.user
+    user_id = member.id
+    contract = await db.get_active_contract(user_id)
+    if (contract or {}).get("id") != expected_contract_id:
+        # Între confirmare și click contractul s-a schimbat (altă concediere, demisie sau angajare).
+        await interaction.edit_original_response(
+            content="⚠️ Situația contractului s-a schimbat între timp. Nu am emis nicio decizie; folosește din nou `/concediaza`."
+        )
+        return
+    ems_member = await fetch_ems_member(user_id)
+    join_date_iso = await resolve_join_date(user_id, ems_member)
+    end_iso = now_local().isoformat()
+    worked_seconds = duration_seconds_between(join_date_iso, end_iso)
+    days = worked_seconds // 86400 if worked_seconds is not None else None
+
+    if contract:
+        ended = await db.terminate_contract(
+            contract["id"],
+            terminated_by=staff.id,
+            terminated_signature=signature,
+            terminated_grade=grade,
+            terminated_reason=f"Concediere: {motiv}",
+            terminated_at_iso=end_iso,
+            worked_seconds=worked_seconds,
+        )
+        if ended is None:
+            await interaction.edit_original_response(
+                content="⚠️ Contractul nu mai este activ (a fost încheiat între timp). Nu am emis nicio decizie."
+            )
+            return
+
+    # Un contract nesemnat sau o demisie în așteptare nu mai au sens după concediere.
+    pending_contract = await db.get_pending_contract(user_id)
+    if pending_contract:
+        await db.cancel_contract(pending_contract["id"])
+        await update_contract_message(pending_contract)
+    await close_pending_resignation(user_id, staff.id, join_date_iso, days)
+
+    nume_ic = (contract or {}).get("nume_ic") or nume_ic_override or getattr(member, "display_name", member.name)
+    cnp = (contract or {}).get("cnp") or cnp_override or "—"
+    functie = (contract or {}).get("functie") or DEFAULT_FUNCTION
+    document_id = new_document_id("CNC")
+
+    png: Optional[bytes] = None
+    try:
+        png = await build_dismissal_png(
+            document_id=document_id,
+            contract=contract,
+            member=member,
+            nume_ic=nume_ic,
+            cnp=cnp,
+            functie=functie,
+            staff=staff,
+            staff_signature=signature,
+            staff_grade=grade,
+            motiv=motiv,
+            join_date_iso=join_date_iso,
+            end_iso=end_iso,
+            worked_seconds=worked_seconds,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Eroare la generarea deciziei de concediere %s.", document_id)
+
+    embed = build_dismissal_embed(
+        user_id=user_id,
+        document_id=document_id,
+        contract=contract,
+        nume_ic=nume_ic,
+        cnp=cnp,
+        functie=functie,
+        join_date_iso=join_date_iso,
+        end_iso=end_iso,
+        worked_seconds=worked_seconds,
+        motiv=motiv,
+        staff=staff,
+        staff_signature=signature,
+        staff_grade=grade,
+        with_image=png is not None,
+    )
+    durata = format_duration_seconds(worked_seconds)
+
+    # 1. Canalul de contracte din serverul principal, unde s-a dat comanda.
+    await send_to_channel(
+        CONTRACT_CHANNEL_ID,
+        content=f"📕 {user_mention(user_id)} nu mai face parte din **{DEPARTMENT_NAME}** · concediere decisă de {staff.mention}",
+        embed=embed,
+        file_payload=png,
+        filename="concediere.png",
+    )
+    # 2. Arhiva de contracte din serverul EMS și logurile.
+    await send_to_channel(
+        CONTRACT_LOG_CHANNEL_ID,
+        content=f"📕 Concediere · {user_mention(user_id)}",
+        embed=embed,
+        file_payload=png,
+        filename="concediere.png",
+    )
+    await send_to_channel(EMS_LOG_CHANNEL_ID, embed=embed, file_payload=png, filename="concediere.png")
+    await send_to_channel(MAIN_LOG_CHANNEL_ID, embed=embed, file_payload=png, filename="concediere.png")
+    # 3. Decizia ajunge și la fostul angajat.
+    dm_sent = await try_dm(
+        user_id,
+        content=(
+            f"📕 Contractul tău cu **{DEPARTMENT_NAME}** a încetat prin concediere.\n"
+            f"📝 Motiv: {motiv}\n"
+            f"📅 Data intrării: **{format_dt(join_date_iso)}**\n"
+            f"📅 Data concedierii: **{format_dt(end_iso)}**\n"
+            f"⏳ Perioadă lucrată: **{durata}**"
+        ),
+        file_payload=png,
+        filename="concediere.png",
+    )
+
+    summary = [f"✅ Concedierea a fost înregistrată (`{document_id}`). Perioadă lucrată: **{durata}** ({format_days(days)})."]
+    if contract:
+        summary.append(f"📄 Contractul `{contract['id']}` a fost încheiat.")
+    else:
+        summary.append("⚠️ Membrul nu avea contract activ în sistem; decizia s-a emis fără număr de contract.")
+    if png:
+        summary.append("📕 Decizia de concediere a fost postată și trimisă.")
+    else:
+        summary.append("⚠️ Nu am putut genera imaginea deciziei. Mesajele au fost trimise fără document.")
+    if not dm_sent:
+        summary.append("⚠️ Nu am putut trimite DM membrului.")
+    summary.append("⚠️ Rolurile se elimină manual.")
+    await interaction.edit_original_response(content="\n".join(summary))
+
+
+class DismissalConfirmView(discord.ui.View):
+    """Confirmarea privată de dinaintea concedierii; butoanele expiră după 3 minute."""
+
+    def __init__(self, origin: discord.Interaction, **dismissal) -> None:
+        super().__init__(timeout=180)
+        self.origin = origin
+        self.dismissal = dismissal
+        self.answered = False
+
+    async def _claim(self, interaction: discord.Interaction) -> bool:
+        if self.answered:
+            await interaction.response.send_message("⏳ Concedierea este deja în lucru.", ephemeral=True)
+            return False
+        self.answered = True
+        self.stop()
+        return True
+
+    @discord.ui.button(label="Confirmă concedierea", style=discord.ButtonStyle.danger, emoji="📕")
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._claim(interaction):
+            return
+        await interaction.response.edit_message(content="⏳ Se emite decizia de concediere...", embed=None, view=None)
+        await finalize_dismissal(interaction, **self.dismissal)
+
+    @discord.ui.button(label="Anulează", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._claim(interaction):
+            return
+        await interaction.response.edit_message(content="✖️ Concedierea a fost anulată.", embed=None, view=None)
+
+    async def on_timeout(self) -> None:
+        if self.answered:
+            return
+        try:
+            await self.origin.edit_original_response(
+                content="⌛ Confirmarea a expirat. Folosește din nou `/concediaza`.", embed=None, view=None
+            )
+        except discord.HTTPException:
+            pass
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        log.exception("Eroare la concediere: %s", error)
+        try:
+            await interaction.edit_original_response(content="❌ A apărut o eroare la concediere. Verifică logurile botului.")
+        except discord.HTTPException:
+            pass
+
+
+# =========================
 # DOCUMENTE MEDICALE
 # =========================
 
@@ -1661,6 +2001,89 @@ async def contract_command(
 async def contract_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     log.exception("Eroare în /contract: %s", error)
     payload = "❌ A apărut o eroare la emiterea contractului. Încearcă din nou."
+    if interaction.response.is_done():
+        await interaction.followup.send(payload, ephemeral=True)
+    else:
+        await interaction.response.send_message(payload, ephemeral=True)
+
+
+@bot.tree.command(
+    name="concediaza",
+    description="Concediază un membru din Legacy EMS și emite decizia de concediere.",
+    guild=main_guild_obj,
+)
+@app_commands.describe(
+    user="Membrul care este concediat.",
+    motiv="Motivul concedierii (apare pe decizie).",
+    semnatura="Semnătura ta: numele și prenumele tău IC.",
+    grad="Gradul tău, al celui care face concedierea.",
+    nume_ic="Doar dacă membrul nu are contract în sistem: numele lui IC.",
+    cnp="Doar dacă membrul nu are contract în sistem: CNP-ul lui IC.",
+)
+async def concediaza_command(
+    interaction: discord.Interaction,
+    user: discord.User,
+    motiv: str,
+    semnatura: str,
+    grad: str,
+    nume_ic: Optional[str] = None,
+    cnp: Optional[str] = None,
+):
+    if interaction.guild_id != MAIN_GUILD_ID:
+        await interaction.response.send_message(
+            "❌ Această comandă funcționează doar pe serverul principal Legacy of CLT.", ephemeral=True
+        )
+        return
+    if not channel_matches(interaction.channel, CONTRACT_CHANNEL_ID):
+        await interaction.response.send_message(
+            f"❌ Folosește această comandă doar în <#{CONTRACT_CHANNEL_ID}>.", ephemeral=True
+        )
+        return
+    if not is_recruiter(interaction.user):
+        await interaction.response.send_message("❌ Nu ai permisiune să concediezi membri.", ephemeral=True)
+        return
+    if user.bot:
+        await interaction.response.send_message("❌ Nu poți concedia un bot.", ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(
+            "❌ Nu te poți concedia singur. Pentru plecare folosește demisia.", ephemeral=True
+        )
+        return
+
+    try:
+        motiv_clean = validate_reason(motiv, "Motivul concedierii")
+        semnatura_clean = validate_name(semnatura)
+        grad_clean = validate_grade(grad, "Gradul tău")
+        nume_ic_clean = validate_name(nume_ic) if nume_ic else None
+        cnp_clean = validate_cnp(cnp) if cnp else None
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
+    # Numele de pe decizie: din contract, altfel din comandă, altfel numele de pe Discord.
+    contract = await db.get_active_contract(user.id)
+    shown_name = (contract or {}).get("nume_ic") or nume_ic_clean or getattr(user, "display_name", user.name)
+    await interaction.response.send_message(
+        embed=build_dismissal_preview(user, contract, shown_name, motiv_clean, semnatura_clean, grad_clean),
+        view=DismissalConfirmView(
+            interaction,
+            member=user,
+            motiv=motiv_clean,
+            signature=semnatura_clean,
+            grade=grad_clean,
+            nume_ic_override=nume_ic_clean,
+            cnp_override=cnp_clean,
+            expected_contract_id=(contract or {}).get("id"),
+        ),
+        ephemeral=True,
+    )
+
+
+@concediaza_command.error
+async def concediaza_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    log.exception("Eroare în /concediaza: %s", error)
+    payload = "❌ A apărut o eroare la concediere. Încearcă din nou."
     if interaction.response.is_done():
         await interaction.followup.send(payload, ephemeral=True)
     else:

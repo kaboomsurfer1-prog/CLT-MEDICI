@@ -168,6 +168,7 @@ def status_ro(status: str) -> str:
         "PENDING": "În așteptare",
         "ACCEPTED": "Acceptată",
         "REFUSED": "Refuzată",
+        "CLOSED": "Închisă",
         "PENDING_SIGN": "Așteaptă răspunsul angajatului",
         "SIGNED": "Semnat / Activ",
         "TERMINATED": "Încetat",
@@ -216,6 +217,13 @@ def validate_grade(value: str, field: str = "Gradul") -> str:
             f"{field} trebuie să aibă între 2 și 60 de caractere "
             "(litere, cifre, spații și `- . , ' ( ) /`)."
         )
+    return value
+
+
+def validate_reason(value: str, field: str = "Motivul", max_length: int = 500) -> str:
+    value = clean_line(value)
+    if not 3 <= len(value) <= max_length:
+        raise ValueError(f"{field} trebuie să aibă între 3 și {max_length} de caractere.")
     return value
 
 

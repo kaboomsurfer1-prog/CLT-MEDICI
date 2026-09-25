@@ -1,4 +1,4 @@
-# Legacy EMS Bot — Contracte, Demisii & Documente Medicale
+# Legacy EMS Bot — Contracte, Demisii, Concedieri & Documente Medicale
 
 Bot Discord pentru **Departamentul Medical Legacy EMS** din orașul **Legacy of CLT**.
 Rulează pe două servere în același timp:
@@ -8,7 +8,7 @@ Rulează pe două servere în același timp:
 | Legacy of CLT (principal) | `1505903653079351357` | angajări, contracte |
 | Legacy EMS (medici) | `1518542545569976492` | arhivă contracte, demisii |
 
-Versiune: `2.2.0-legacy-ems-medical`
+Versiune: `2.3.0-legacy-ems-concediere`
 
 ---
 
@@ -104,7 +104,45 @@ Nu mai există `/setintrare`. Data intrării este determinată automat, în ordi
 
 ---
 
-## 3. Documente medicale: `/radiografie` și `/analize`
+## 3. Concediere: `/concediaza`
+
+Pe lângă demisie, conducerea poate scoate pe cineva din departament direct.
+În canalul de contracte `1548327664694333520` (serverul principal), un membru
+cu rolul `1517181051288420372` (sau administrator) folosește:
+
+```text
+/concediaza user:@membru motiv:Absențe nemotivate repetate
+            semnatura:Mihai Ionescu grad:Director Medical
+```
+
+| Câmp | Ce se scrie |
+| --- | --- |
+| `user` | membrul concediat |
+| `motiv` | motivul concedierii; apare pe decizie |
+| `semnatura` | numele și prenumele IC al celui care concediază |
+| `grad` | gradul celui care concediază |
+| `nume_ic`, `cnp` | opționale: doar pentru membrii fără contract în sistem |
+
+1. Botul arată **doar ție** un mesaj de confirmare, cu datele contractului.
+   Apeși **📕 Confirmă concedierea** sau **Anulează** (butoanele expiră în 3 minute).
+2. La confirmare, contractul activ se încheie și botul generează **Decizia de
+   Concediere** (imagine A4, în română): logo-urile, datele angajatului, data
+   intrării, data concedierii, perioada lucrată, motivul, articolele deciziei,
+   semnătura conducerii și ștampila.
+3. Decizia se postează în canalul de contracte, în canalul `1548329089956581487`
+   din serverul EMS, în logurile EMS și principal (dacă sunt setate) și se
+   trimite membrului prin DM.
+
+Membrii angajați înainte de sistemul de contracte pot fi concediați și ei:
+decizia se emite fără număr de contract, cu numele și CNP-ul din `nume_ic` și
+`cnp` (altfel cu numele de pe Discord). Un contract încă nesemnat se anulează,
+iar o cerere de demisie în așteptare se închide automat.
+
+Rolurile Discord se elimină **manual**, la fel ca la demisie.
+
+---
+
+## 4. Documente medicale: `/radiografie` și `/analize`
 
 Cele două comenzi merg **doar** în canalele medicale:
 
@@ -155,11 +193,12 @@ o altă persoană, cu obligația de despăgubire pentru îngrijirile medicale.
 
 ---
 
-## 4. Comenzi
+## 5. Comenzi
 
 | Comandă | Unde | Cine |
 | --- | --- | --- |
 | `/contract` | canalul de contracte, serverul principal | rolurile din `RECRUITER_ROLE_IDS` + administratori |
+| `/concediaza` | canalul de contracte, serverul principal | rolurile din `RECRUITER_ROLE_IDS` + administratori |
 | `/radiografie` | canalele din `MEDICAL_CHANNEL_IDS` | oricine scrie acolo (sau doar `MEDICAL_ROLE_IDS`, dacă e setat) |
 | `/analize` | canalele din `MEDICAL_CHANNEL_IDS` | oricine scrie acolo (sau doar `MEDICAL_ROLE_IDS`, dacă e setat) |
 
@@ -169,7 +208,7 @@ Comenzile vechi (`/setintrare`, `/intrare`, `/demisii`, `/semneaza`) au fost
 
 ---
 
-## 5. Variabile Railway
+## 6. Variabile Railway
 
 Obligatorii:
 
@@ -220,7 +259,7 @@ demisie este dezactivat (apare un avertisment în loguri).
 
 ---
 
-## 6. Permisiuni Discord necesare
+## 7. Permisiuni Discord necesare
 
 **Developer Portal — Intents:**
 
@@ -234,7 +273,7 @@ demisie este dezactivat (apare un avertisment în loguri).
 
 ---
 
-## 7. Logo-uri pe documente
+## 8. Logo-uri pe documente
 
 Vezi [`assets/logos/README.md`](assets/logos/README.md).
 Ordinea: fișier local → `MAIN_LOGO_URL` / `EMS_LOGO_URL` → iconița serverului Discord.
@@ -244,7 +283,7 @@ local și pe Railway.
 
 ---
 
-## 8. Storage Railway
+## 9. Storage Railway
 
 Serviciul `CLT-MEDICI` are deja un Railway Volume (`clt-medici-volume`) montat pe:
 
@@ -258,13 +297,13 @@ pierde la restart.
 
 ---
 
-## 9. Structura proiectului
+## 10. Structura proiectului
 
 ```text
 main.py        comenzi, butoane, ferestre, fluxuri
 config.py      variabile de mediu si validare la pornire
 database.py    SQLite: contracte, demisii, date de intrare
-documents.py   generarea imaginilor (contract, decizie de incetare, radiografie, analize)
+documents.py   generarea imaginilor (contract, decizie de incetare, concediere, radiografie, analize)
 medical.py     texte medicale, stari, zone si valorile analizelor
 xray.py        filmul radiografiei, desenat procedural pentru fiecare zona
 utils.py       date, durate, validari, formatari
